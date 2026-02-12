@@ -139,6 +139,12 @@ hwpx (ZIP) → zipfile 해제
   │   ├── hp:rect/hp:drawText → > [글상자] text
   │   ├── hp:checkBtn/radioBtn/comboBox/btn/edit → 양식 개체
   │   ├── hp:footnote/hp:endnote → [^N] 인라인 참조
+  │   ├── hp:dutmal → <ruby>본말<rt>닷말</rt></ruby>
+  │   ├── hp:textart → > [글맵시] text
+  │   ├── hp:ole → <!-- OLE: comment -->
+  │   ├── hp:deleteBegin/End → ~~취소선~~
+  │   ├── hp:fieldBegin HYPERLINK → [text](url)
+  │   ├── hp:colPr → <!-- [N단 레이아웃] -->
   │   └── 섹션 간 --- 구분자
   ├── BinData/* → 이미지 추출 (BMP→PNG 변환)
   └── template_info.json → 페이지 설정/양식 메타 보존
@@ -584,8 +590,11 @@ hwpxlib 프로젝트(`github.com/neolord0/hwpxlib`)의 47개 테스트 HWPX 파�
 | SimpleTable.hwpx | 표 | `hp:tbl/hp:tr/hp:tc` | ✅ 정상 | 4줄 60자 추출 |
 | sample1.hwpx | 텍스트+서식 | `hp:run/hp:t` | ✅ 정상 | *수학* 이탤릭 |
 | SimplePicture.hwpx | 이미지 | `hp:pic` | ✅ 정상 | `![image1]()` |
-| MultiColumn.hwpx | 다단 | `hp:colPr colCount` | ✅ 텍스트 추출 | 다단 구조는 소실 |
-| ChangeTrack.hwpx | 변경 추적 | `hhs:*` | ⚠️ 일부만 | 9자만 추출 |
+| MultiColumn.hwpx | 다단 | `hp:colPr colCount` | ✅ P3 구현 | `<!-- [3단 레이아웃] -->` |
+| ChangeTrack.hwpx | 변경 추적 | `hp:deleteBegin/End` | ✅ P3 구현 | `~~삭제~~ 삽입` |
+| SimpleDutmal.hwpx | 덧말(ruby) | `hp:dutmal` | ✅ P3 구현 | `<ruby>본말<rt>닷말</rt></ruby>` |
+| SimpleTextArt.hwpx | 글맵시 | `hp:textart` | ✅ P3 구현 | `> [글맵시] text` |
+| SimpleOLE.hwpx | OLE 개체 | `hp:ole` | ✅ P3 구현 | `<!-- OLE: comment -->` |
 | SimpleEquation.hwpx | 수식 | `hp:equation/hp:script` | ✅ P1 구현 | `$$ script $$` |
 | HeaderFooter.hwpx | 머리글/꼬리글 | `hp:header/hp:footer` | ✅ P1 구현 | `<!-- 머리글: text -->` |
 | SimpleComboBox.hwpx | 콤보박스 | `hp:comboBox` | ✅ P2 구현 | `[콤보: name]` |
@@ -637,11 +646,18 @@ hwpxlib 프로젝트(`github.com/neolord0/hwpxlib`)의 47개 테스트 HWPX 파�
 6. ✅ 각주/미주 → 인라인 `[^N]` + 문서 끝 `[^N]: text`
 7. ✅ 다중 섹션 → section*.xml 자동 탐색, `---` 구분자
 
-**P3 — 미지원 기능 (향후)**
-8. 하이퍼링크/책갈피
-9. 변경 추적
-10. 덧말(ruby text) / TextArt / OLE
-11. OWPML 2024 네임스페이스 호환 (`owpml.org/owpml/2024/*`)
+**P3 — 잔여 기능 + 텍스트 완전성 ✅ 완료 (커밋 30d2551)**
+8. ✅ 덧말(ruby text) → `<ruby>본말<rt>닷말</rt></ruby>`
+9. ✅ TextArt(글맵시) → `> [글맵시] text` (text 속성에서 추출)
+10. ✅ OLE 개체 → `<!-- OLE: comment (ref) -->` 주석
+11. ✅ 변경 추적 → `~~삭제~~` 취소선 + 삽입 그대로
+12. ✅ 하이퍼링크 → `[text](url)` (방어적 구현)
+13. ✅ 다단 레이아웃 → `<!-- [N단 레이아웃] -->` 메타데이터
+
+**P4 — 미지원 기능 (향후)**
+14. OWPML 2024 네임스페이스 호환 (`owpml.org/owpml/2024/*`)
+15. 책갈피 (`hp:bookmark`)
+16. 탭/들여쓰기 정밀 변환
 
 ### 12.4 smart_replace.py v2 개선 사항
 
