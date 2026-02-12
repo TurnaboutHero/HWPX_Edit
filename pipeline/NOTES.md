@@ -393,13 +393,255 @@ interface DashboardSection {
    - 인라인 CSS만으로 독립 실행 가능한 보고서 생성
    - 외부 의존성 없이 이메일/공유에 적합
 
-## 8. 의존성
+## 8. pypandoc-hwpx 분석 (GitHub: msjang/pypandoc-hwpx)
+
+### 8.1 프로젝트 개요
+
+| 항목 | 내용 |
+|------|------|
+| 저장소 | https://github.com/msjang/pypandoc-hwpx |
+| 버전 | 0.1.1 (2025-12-18 릴리즈) |
+| 라이선스 | MIT |
+| Stars | 131 |
+| Issues | 0개 (열린/닫힌 모두 없음) |
+| 의존성 | Python 3.6+, Pandoc, pypandoc |
+
+### 8.2 핵심 동작 원리
+
+```
+입력 파일 (md/docx/html)
+  → Pandoc → JSON AST
+    → PandocToHwpx.py → HWPX (ZIP)
+      ├── header.xml (스타일: reference-doc에서 복사)
+      ├── section0.xml (본문: AST에서 생성)
+      ├── BinData/* (이미지 임베딩)
+      └── 기타 메타데이터
+```
+
+### 8.3 `--reference-doc` 동작 방식
+
+reference-doc(원본 hwpx)을 지정하면:
+1. `header.xml` 전체를 원본에서 복사 (스타일 정의 보존)
+2. `section0.xml`에서 `<hs:sec>` ~ 첫 번째 `<hp:p>` 사이의 **secPr(페이지 설정)**을 추출
+3. 새로 생성된 본문 XML 앞에 원본 secPr을 접두어로 붙임
+4. `_ensure_table_border_fill()`로 테이블용 borderFill이 없으면 새로 생성
+
+**미지정 시**: 패키지 내장 `blank.hwpx`를 템플릿으로 사용 (Mac Word 16.73 기반, borderFill 2개)
+
+### 8.4 발견된 버그 (pypandoc-hwpx 0.1.1)
+
+#### 버그 1: borderFillIDRef 하드코딩 (PandocToHwpx.py:721)
+
+```python
+# 문제 코드 (PandocToHwpx.py 721행)
+tbl_xml = f'<hp:tbl ... borderFillIDRef="3" ...'
+```
+
+- `hp:tbl`의 `borderFillIDRef`가 항상 `"3"`으로 하드코딩
+- `blank.hwpx` 사용 시에는 `_ensure_table_border_fill()`이 ID 3의 borderFill을 생성하므로 문제없음
+- **`--reference-doc` 사용 시**: 원본 header.xml에서 ID 3이 테이블 보더가 아닌 다른 용도일 수 있음
+- **결과**: 테이블 테두리가 의도치 않은 스타일로 표시됨
+
+#### 버그 2: 빈 마크다운 셀 → 빈 hp:subList (한글 크래시)
+
+```
+마크다운:  |  |  ← 빈 셀
+생성 XML:  <hp:subList listType="PARA"></hp:subList>  ← hp:p 없음!
+```
+
+- 빈 마크다운 셀(`|  |`)을 변환할 때 `hp:subList` 안에 `hp:p` 자식 요소를 넣지 않음
+- **한컴오피스 한글이 빈 subList에서 크래시** (프로그램 강제 종료)
+- 이것이 roundtrip hwpx가 열리지 않는 **주요 원인**
+
+#### 우리의 해결책 (`md_to_hwpx.py._patch_hwpx()`)
+
+```python
+# 패치 1: 빈 subList에 빈 paragraph 주입
+empty_para = '<hp:p paraPrIDRef="..." ...><hp:run charPrIDRef="0"><hp:t></hp:t></hp:run></hp:p>'
+
+# 패치 2: hp:tbl의 borderFillIDRef를 첫 번째 셀의 값으로 통일
+```
+
+> GitHub Issues에 이 버그들이 보고되어 있지 않음 (0개 이슈). 향후 이슈 제출 고려.
+
+### 8.5 Pandoc JSON AST의 근본적 한계
+
+pypandoc-hwpx는 Pandoc의 JSON AST를 입력으로 받기 때문에, AST에 포함되지 않는 정보는 변환 불가:
+
+| 손실되는 정보 | 설명 |
+|--------------|------|
+| 셀 너비 (cellSz) | 마크다운에는 열 너비 개념 없음 → 균등 분배 |
+| 셀 병합 (cellSpan) | 마크다운 표는 colspan/rowspan 미지원 |
+| 표 안의 표 | Pandoc AST가 중첩 테이블 미지원 |
+| 셀 배경색 | 마크다운에 해당 문법 없음 |
+| 장평/자간 | Pandoc AST에 미포함 |
+| 페이지 나누기 위치 | AST에 미포함 |
+
+## 9. 원본 vs 변환후 비교 분석 (스크린샷)
+
+### 9.1 원본 문서 특징 (원본.png)
+
+- **복잡한 표 구조**: 46개 테이블, 다양한 셀 병합 (2열 병합, 3행 병합 등)
+- **정교한 셀 크기**: 열마다 다른 너비, 행마다 다른 높이
+- **서식 풍부**: 굵은 헤더, 셀 배경색 (회색/파란색/주황색), 테두리 스타일 차이
+- **이미지 삽입**: 표 안에 이미지 배치, 정확한 크기 지정
+- **표 안의 표**: 한글 특유의 중첩 표 구조
+- **다단 레이아웃**: 좌우 구분된 셀 레이아웃
+
+### 9.2 변환 후 문제점 (변환후.png — pypandoc-hwpx roundtrip)
+
+| 문제 | 심각도 | 원인 |
+|------|--------|------|
+| 셀 병합 해제 — 병합되었던 셀이 개별 셀로 분리 | 치명적 | 마크다운에 colspan/rowspan 문법 없음 |
+| 균등 열 너비 — 모든 열이 동일한 너비 | 치명적 | pypandoc-hwpx가 열 너비를 균등 분배 |
+| 표 안의 표 소실 — 중첩 표가 평면화 | 치명적 | Pandoc AST 미지원 |
+| 셀 배경색 소실 — 모든 셀 배경이 흰색 | 중요 | 마크다운에 셀 색상 문법 없음 |
+| 행 높이 균등화 — 원래 다양했던 높이가 통일 | 중요 | pypandoc-hwpx가 높이 균등 분배 |
+| 이미지 위치 변경 — 표 안 이미지가 표 밖으로 | 중요 | 마크다운 표 안 이미지 한계 |
+| 텍스트 서식 부분 손실 — 셀 내 굵기/색상 차이 소실 | 경미 | 일부 인라인 서식 보존됨 |
+| 빈 행/열 추가 — 원본에 없는 빈 셀 생성 | 경미 | 병합 해제로 인한 부산물 |
+
+### 9.3 스마트 교체(smart_replace.py)로 해결되는 문제
+
+| 문제 | pypandoc roundtrip | 스마트 교체 |
+|------|-------------------|-------------|
+| 셀 병합 | 해제됨 | **보존** |
+| 셀 너비/높이 | 균등화 | **보존** |
+| 표 안의 표 | 소실 | **보존** |
+| 셀 배경색 | 소실 | **보존** |
+| 테두리 스타일 | 변경됨 | **보존** |
+| 이미지 위치 | 이동됨 | **보존** |
+| 텍스트 내용 변경 | 반영 | **반영** |
+| 새 표/행/열 추가 | 가능 | 불가 |
+| 문단 추가/삭제 | 가능 | 불가 |
+
+## 10. 스마트 교체 (`smart_replace.py`)
+
+### 10.1 개요
+
+pypandoc-hwpx의 표 서식 손실 문제를 근본적으로 해결하기 위한 대안 변환 방식.
+원본 HWPX의 XML 구조를 그대로 유지하면서, 편집된 마크다운의 **텍스트 내용만** 반영.
+
+### 10.2 동작 원리
+
+```
+원본.hwpx → section0.xml 파싱 → XML 블록 추출 (209개)
+편집된.md → 마크다운 파싱  → MD 블록 추출 (216개)
+                ↓
+        위치 기반 매칭 (178개 매칭)
+                ↓
+    XML의 hp:t 텍스트만 교체 (91개 변경, 30개 표 업데이트)
+                ↓
+        원본 HWPX + 수정된 section0.xml → 출력.hwpx
+```
+
+### 10.3 사용법
+
+```bash
+# 단독 실행
+python smart_replace.py 원본.hwpx 편집된.md -o 최종본.hwpx
+
+# convert.py 통합 CLI
+python convert.py smart 원본.hwpx 편집된.md -o 최종본.hwpx
+```
+
+### 10.4 권장 워크플로
+
+```
+1. python convert.py to-md 원본.hwpx -o output/문서.md
+2. AI로 output/문서.md 편집 (텍스트 내용만 변경)
+3. python convert.py smart 원본.hwpx output/문서.md -o 최종본.hwpx
+```
+
+**주의**: 마크다운에서 표 행/열을 추가/삭제하면 매칭이 어긋남.
+텍스트 내용 편집만 하고, 구조 변경이 필요하면 원본 hwpx를 직접 수정할 것.
+
+## 11. 의존성
 
 | 패키지 | 버전 | 용도 |
 |--------|------|------|
 | Python | 3.13.2 | 런타임 |
 | Pandoc | 3.9 | pypandoc-hwpx 내부 사용 |
-| pypandoc-hwpx | 0.1.1 | md → hwpx 변환 |
+| pypandoc-hwpx | 0.1.1 | md → hwpx 변환 (to-hwpx 모드) |
 | pypandoc | 1.16.2 | Pandoc Python 래퍼 |
-| lxml | 6.0.2 | HWPX XML 파싱 |
+| lxml | 6.0.2 | HWPX XML 파싱 (smart 모드 + to-md) |
 | Pillow | 12.0.0 | BMP → PNG 이미지 변환 |
+
+## 12. 기능 커버리지 분석 (hwpxlib 테스트 파일 기반)
+
+hwpxlib 프로젝트(`github.com/neolord0/hwpxlib`)의 47개 테스트 HWPX 파일로 파이프라인을 검증했다.
+
+### 12.1 기능별 테스트 결과
+
+| 테스트 파일 | 기능 | XML 태그 | 결과 | 비고 |
+|---|---|---|---|---|
+| SimpleTable.hwpx | 표 | `hp:tbl/hp:tr/hp:tc` | ✅ 정상 | 4줄 60자 추출 |
+| sample1.hwpx | 텍스트+서식 | `hp:run/hp:t` | ✅ 정상 | *수학* 이탤릭 |
+| SimplePicture.hwpx | 이미지 | `hp:pic` | ✅ 정상 | `![image1]()` |
+| MultiColumn.hwpx | 다단 | `hp:colPr colCount` | ✅ 텍스트 추출 | 다단 구조는 소실 |
+| ChangeTrack.hwpx | 변경 추적 | `hhs:*` | ⚠️ 일부만 | 9자만 추출 |
+| SimpleEquation.hwpx | **수식** | `hp:equation/hp:script` | ❌ 무시됨 | 0자 |
+| HeaderFooter.hwpx | **머리글/꼬리글** | `hp:header/hp:footer` | ❌ 무시됨 | 0자 |
+| SimpleComboBox.hwpx | **콤보박스** | `hp:comboBox` | ❌ 무시됨 | 0자 |
+| SimpleButtons.hwpx | **버튼/체크/라디오** | `hp:btn/hp:checkBtn/hp:radioBtn` | ❌ 무시됨 | 0자 |
+| SimpleRectangle.hwpx | **도형(글상자)** | `hp:rect/hp:drawText` | ❌ 무시됨 | "ABC" 텍스트 소실 |
+| 재난안전종합상황.hwpx | 대용량(7.3MB) | 복합 | ✅ 처리 | 1599줄 65KB |
+
+### 12.2 미지원 기능의 XML 구조
+
+**수식** — `hp:equation` 내 `hp:script`에 한글 수식 문법 저장:
+```xml
+<hp:equation ...><hp:script>{"123"} over {123 sqrt {3466}}</hp:script></hp:equation>
+```
+
+**머리글/꼬리글** — `hp:header/hp:footer` 내 `hp:subList` → `hp:p` 구조:
+```xml
+<hp:header applyPageType="BOTH"><hp:subList ...>
+  <hp:p ...><hp:run ...><hp:t>머리말 테스트</hp:t></hp:run></hp:p>
+</hp:subList></hp:header>
+```
+
+**양식 개체** — `hp:checkBtn/hp:radioBtn/hp:comboBox/hp:btn` 속성에 텍스트:
+```xml
+<hp:checkBtn caption="선택 상자1" value="UNCHECKED" name="CheckBox1" .../>
+<hp:radioBtn caption="라디오 단추1" value="UNCHECKED" name="RadioButton1" .../>
+<hp:comboBox name="ComboBox1" selectedValue="" .../>
+```
+
+**도형 안 텍스트** — `hp:rect` → `hp:drawText` → `hp:subList` → `hp:p`:
+```xml
+<hp:rect ...><hp:drawText ...><hp:subList ...>
+  <hp:p ...><hp:run ...><hp:t>ABC</hp:t></hp:run></hp:p>
+</hp:subList></hp:drawText></hp:rect>
+```
+
+### 12.3 개선 우선순위
+
+**P1 — 텍스트 손실 방지 (smart_replace에도 영향)**
+1. 도형/글상자 안 텍스트 (`hp:drawText` → `hp:subList`)
+2. 머리글/꼬리글 (`hp:header/hp:footer`)
+3. 수식 (`hp:script` → LaTeX 변환)
+
+**P2 — 양식 문서 지원**
+4. 체크박스/라디오 → `[ ] caption` / `[x] caption`
+5. 콤보박스/입력란 → `[ComboBox: value]`
+6. 각주/미주
+
+**P3 — 구조 완성도**
+7. 다중 섹션 (section1.xml, section2.xml...)
+8. 하이퍼링크/책갈피
+9. 변경 추적
+
+### 12.4 smart_replace.py v2 개선 사항
+
+프래그먼트 레벨 diff 폴백 추가 (2025-02):
+- 전략 1: 전체 셀 텍스트 매칭 (단일 `hp:t` 셀)
+- 전략 2: `difflib.SequenceMatcher`로 변경 단어만 교체 (멀티런 셀)
+- `_normalize()`에서 `*` 제거 (마크다운 라운드트립 아티팩트 방지)
+
+### 12.5 테스트 데이터
+
+hwpxlib 테스트 파일 (`test_data/hwpxlib/testFile/`):
+- `reader_writer/` — 기능별 단위 테스트 (25개)
+- `error/` — 실제 문서 에러 케이스 (15개)
+- `tool/` — 텍스트 추출기 테스트 (7개)
