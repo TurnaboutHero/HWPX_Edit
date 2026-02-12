@@ -2,19 +2,20 @@
 smart_replace.py - 원본 HWPX 구조 보존 + 마크다운 텍스트 반영
 
 원본 HWPX의 바이트를 그대로 보존하면서, 편집된 마크다운에서 변경된
-테이블 셀 텍스트만 원본 XML 문자열에 직접 치환합니다.
+테이블 셀 텍스트 및 일반 문단 텍스트를 원본 XML 문자열에 직접 치환합니다.
 
 lxml은 분석(파싱)에만 사용하고, 직렬화는 하지 않습니다.
 이를 통해 CRLF, 속성 순서, 네임스페이스 등이 원본과 100% 동일하게 보존됩니다.
 
 주요 장점:
   - 표 서식 완벽 보존 (셀 병합, 너비, 높이, 테두리, 배경색)
+  - 일반 문단 텍스트 교체 지원
   - 원본 XML 바이트 수준 보존 (lxml 직렬화 우회)
   - pypandoc-hwpx 버그 우회
 
 제한사항:
-  - 테이블 셀 텍스트만 교체 가능 (문단 텍스트는 원본 유지)
   - 구조 변경(행/열 추가/삭제)은 반영 불가
+  - 제목, 이미지 참조, 인용문 내 텍스트는 교체 대상에서 제외
 """
 import os
 import re
@@ -133,6 +134,111 @@ def _parse_table_lines(table_lines):
     return cells
 
 
+def parse_markdown_paragraphs(md_text):
+    """마크다운에서 일반 텍스트 문단만 순서대로 추출.
+
+    테이블 행, 제목, 이미지, 인용문, 빈 줄, 구분선, HTML 주석 등을 제외하고
+    연속된 일반 텍스트 줄을 하나의 문단으로 합칩니다.
+
+    Returns:
+        list of str: 문단 텍스트 목록
+    """
+    paragraphs = []
+    lines = md_text.split('\n')
+    i = 0
+    in_table = False
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # 빈 줄 — 현재 문단 종료
+        if not stripped:
+            in_table = False
+            i += 1
+            continue
+
+        # 테이블 행 (|로 시작하거나 구분선 |---|)
+        if stripped.startswith('|') or (in_table and '|' in stripped):
+            in_table = True
+            i += 1
+            continue
+
+        # 테이블 시작 감지 (다음 줄이 구분선)
+        if '|' in stripped and i + 1 < len(lines):
+            next_stripped = lines[i + 1].strip()
+            if re.match(r'^\|[\s\-:|]+\|$', next_stripped):
+                in_table = True
+                i += 1
+                continue
+
+        in_table = False
+
+        # 제목 (#으로 시작)
+        if stripped.startswith('#'):
+            i += 1
+            continue
+
+        # 인용문 (>로 시작)
+        if stripped.startswith('>'):
+            i += 1
+            continue
+
+        # 이미지 (![으로 시작)
+        if stripped.startswith('!['):
+            i += 1
+            continue
+
+        # 구분선 (---, ***, ___)
+        if re.match(r'^[-*_]{3,}\s*$', stripped):
+            i += 1
+            continue
+
+        # HTML 주석 (<!-- -->)
+        if stripped.startswith('<!--'):
+            i += 1
+            continue
+
+        # 수식 블록 ($$)
+        if stripped.startswith('$$'):
+            i += 1
+            continue
+
+        # 양식 개체 패턴 ([x], [ ], (o), ( ), [콤보:, [버튼:, [입력란:)
+        if re.match(r'^\[[ x]\]\s', stripped) or re.match(r'^\([ o]\)\s', stripped):
+            i += 1
+            continue
+        if re.match(r'^\[(콤보|버튼|입력란):', stripped):
+            i += 1
+            continue
+
+        # 일반 텍스트 줄 — 연속된 줄을 하나의 문단으로 합침
+        para_lines = []
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            if not stripped:
+                break
+            if stripped.startswith('|') or stripped.startswith('#') or \
+               stripped.startswith('>') or stripped.startswith('![') or \
+               stripped.startswith('<!--') or stripped.startswith('$$'):
+                break
+            if re.match(r'^[-*_]{3,}\s*$', stripped):
+                break
+            # 다음 줄이 테이블 구분선이면 현재 줄은 테이블 헤더
+            if '|' in stripped and i + 1 < len(lines):
+                next_stripped = lines[i + 1].strip()
+                if re.match(r'^\|[\s\-:|]+\|$', next_stripped):
+                    break
+            para_lines.append(stripped)
+            i += 1
+
+        if para_lines:
+            paragraphs.append(' '.join(para_lines))
+
+    return paragraphs
+
+
 # ============================================================
 # XML 분석 (lxml — 읽기 전용, 직렬화 안 함)
 # ============================================================
@@ -159,6 +265,30 @@ def extract_xml_tables(section_root):
                 'cells': cells,
             })
     return tables
+
+
+def extract_xml_paragraphs(section_root):
+    """section XML에서 테이블을 포함하지 않는 최상위 문단 텍스트 추출.
+
+    hwpx_to_md.py의 _process_section()과 동일한 순서로 순회하여
+    마크다운 문단과 1:1 매칭할 수 있도록 합니다.
+
+    Returns:
+        list of str: 비어있지 않은 순수 텍스트 문단 목록
+    """
+    paragraphs = []
+    for para in section_root.findall('hp:p', NS):
+        # 테이블을 포함한 문단은 건너뜀 (이미 테이블로 처리)
+        if para.findall('.//hp:tbl', NS):
+            continue
+        # 이미지를 포함한 문단은 건너뜀
+        if para.findall('.//hp:pic', NS):
+            continue
+        text = _get_para_text(para)
+        if not text.strip():
+            continue
+        paragraphs.append(text.strip())
+    return paragraphs
 
 
 def _get_para_text(para):
@@ -321,8 +451,9 @@ def _find_section_files(z):
 
 
 def smart_replace(original_hwpx, edited_md, output_hwpx=None):
-    """원본 HWPX 구조를 보존하며 편집된 마크다운의 테이블 텍스트만 반영.
+    """원본 HWPX 구조를 보존하며 편집된 마크다운의 텍스트를 반영.
 
+    테이블 셀 텍스트와 일반 문단 텍스트를 모두 교체합니다.
     다중 섹션(section0.xml, section1.xml, ...)을 모두 처리합니다.
     원본 XML 바이트를 직접 조작하여 lxml 직렬화를 우회합니다.
     """
@@ -335,11 +466,12 @@ def smart_replace(original_hwpx, edited_md, output_hwpx=None):
     print(f"  편집된 MD: {edited_md}")
     print(f"  출력 HWPX: {output_hwpx}")
 
-    # 1. 마크다운에서 테이블만 추출
+    # 1. 마크다운에서 테이블 + 문단 추출
     with open(edited_md, 'r', encoding='utf-8') as f:
         md_text = f.read()
     md_tables = parse_markdown_tables(md_text)
-    print(f"  마크다운 테이블: {len(md_tables)}개")
+    md_paragraphs = parse_markdown_paragraphs(md_text)
+    print(f"  마크다운 테이블: {len(md_tables)}개, 문단: {len(md_paragraphs)}개")
 
     # 2. 원본 HWPX에서 모든 section*.xml 찾기 (숫자순 정렬)
     with open(original_hwpx, 'rb') as f:
@@ -360,10 +492,12 @@ def smart_replace(original_hwpx, edited_md, output_hwpx=None):
     global NS
     close_tag = '</hp:t>'  # 기본값 — 첫 섹션에서 감지하여 교체
 
-    # 섹션별 데이터: {filename: {'raw_xml': str, 'xml_tables': list, 'table_offset': int}}
+    # 섹션별 데이터: {filename: {'raw_xml': str, 'xml_tables': list, 'xml_paragraphs': list, 'table_offset': int, 'para_offset': int}}
     section_data = {}
     all_xml_tables = []  # 전체 테이블 (섹션 순서대로 이어붙임)
+    all_xml_paragraphs = []  # 전체 문단 (섹션 순서대로 이어붙임)
     table_to_section = []  # 각 테이블이 속한 섹션 파일명
+    para_to_section = []  # 각 문단이 속한 섹션 파일명
 
     for idx, (sec_num, sec_filename) in enumerate(section_files):
         sec_xml_bytes = z_in.read(sec_filename)
@@ -380,19 +514,27 @@ def smart_replace(original_hwpx, edited_md, output_hwpx=None):
         # lxml으로 분석만 수행 (직렬화 안 함)
         section_root = etree.fromstring(sec_xml_bytes)
         xml_tables = extract_xml_tables(section_root)
+        xml_paragraphs = extract_xml_paragraphs(section_root)
 
         table_offset = len(all_xml_tables)
+        para_offset = len(all_xml_paragraphs)
         section_data[sec_filename] = {
             'raw_xml': raw_xml,
             'xml_tables': xml_tables,
+            'xml_paragraphs': xml_paragraphs,
             'table_offset': table_offset,
+            'para_offset': para_offset,
         }
 
         for xt in xml_tables:
             all_xml_tables.append(xt)
             table_to_section.append(sec_filename)
 
-    print(f"  XML 테이블: {len(all_xml_tables)}개")
+        for xp in xml_paragraphs:
+            all_xml_paragraphs.append(xp)
+            para_to_section.append(sec_filename)
+
+    print(f"  XML 테이블: {len(all_xml_tables)}개, 문단: {len(all_xml_paragraphs)}개")
 
     # 4. 테이블 매칭 및 섹션별 교체 목록 생성
     # per_section_replacements: {filename: [(old_escaped, new_escaped), ...]}
@@ -436,26 +578,80 @@ def smart_replace(original_hwpx, edited_md, output_hwpx=None):
     total_replacements = sum(len(v) for v in per_section_replacements.values())
     print(f"  교체 대상 셀: {total_replacements}개")
 
-    # 5. 섹션별 원본 XML 문자열에 직접 치환
+    # 4.5. 문단 매칭 및 섹션별 교체 목록 생성
+    per_section_para_replacements = {f: [] for _, f in section_files}
+    para_matched = 0
+    para_changed = 0
+
+    min_para_count = min(len(all_xml_paragraphs), len(md_paragraphs))
+    for i in range(min_para_count):
+        xml_para_text = all_xml_paragraphs[i]
+        md_para_text = _strip_md_format(md_paragraphs[i])
+
+        # 정규화 비교 — 실제 내용이 다를 때만 교체
+        if _normalize(xml_para_text) == _normalize(md_para_text):
+            para_matched += 1
+            continue
+
+        para_matched += 1
+        para_changed += 1
+        sec_filename = para_to_section[i]
+
+        # XML 이스케이프
+        old_escaped = _xml_escape(xml_para_text)
+        new_escaped = _xml_escape(md_para_text)
+        per_section_para_replacements[sec_filename].append((old_escaped, new_escaped))
+
+    total_para_replacements = sum(len(v) for v in per_section_para_replacements.values())
+    print(f"  문단 매칭: {para_matched}개, 변경: {para_changed}개")
+    if total_para_replacements > 0:
+        print(f"  교체 대상 문단: {total_para_replacements}개")
+
+    # 5. 섹션별 원본 XML 문자열에 직접 치환 (테이블 + 문단)
     # modified_sections: {filename: modified_bytes} — 변경된 섹션만 포함
     modified_sections = {}
     total_applied = 0
+    total_para_applied = 0
 
     for _, sec_filename in section_files:
-        replacements = per_section_replacements[sec_filename]
-        if not replacements:
+        cell_replacements = per_section_replacements[sec_filename]
+        para_replacements = per_section_para_replacements[sec_filename]
+
+        if not cell_replacements and not para_replacements:
             continue
 
         raw_xml = section_data[sec_filename]['raw_xml']
-        raw_xml, applied = apply_cell_replacements(raw_xml, replacements, close_tag)
-        total_applied += applied
+
+        # 테이블 셀 교체
+        cell_applied = 0
+        if cell_replacements:
+            raw_xml, cell_applied = apply_cell_replacements(raw_xml, cell_replacements, close_tag)
+            total_applied += cell_applied
+
+        # 문단 텍스트 교체 (동일한 apply_cell_replacements 재활용)
+        para_applied = 0
+        if para_replacements:
+            raw_xml, para_applied = apply_cell_replacements(raw_xml, para_replacements, close_tag)
+            total_para_applied += para_applied
+
         modified_sections[sec_filename] = raw_xml.encode('utf-8')
 
         if len(section_files) > 1:
-            print(f"    {sec_filename}: {applied}개 적용")
+            parts = []
+            if cell_applied > 0:
+                parts.append(f"셀 {cell_applied}개")
+            if para_applied > 0:
+                parts.append(f"문단 {para_applied}개")
+            if parts:
+                print(f"    {sec_filename}: {', '.join(parts)} 적용")
 
-    if total_applied > 0:
-        print(f"  실제 적용: {total_applied}개")
+    if total_applied > 0 or total_para_applied > 0:
+        parts = []
+        if total_applied > 0:
+            parts.append(f"셀 {total_applied}개")
+        if total_para_applied > 0:
+            parts.append(f"문단 {total_para_applied}개")
+        print(f"  실제 적용: {', '.join(parts)}")
     else:
         print(f"  변경 사항 없음 — 원본 그대로 복사")
 
