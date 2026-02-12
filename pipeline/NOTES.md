@@ -129,11 +129,17 @@ hwpx (ZIP) → zipfile 해제
   ├── header.xml → lxml 파싱 → HwpxStyleMap 구축
   │   ├── paraPrIDRef → 제목 레벨 매핑
   │   └── charPrIDRef → 굵기/기울임/취소선 매핑
-  ├── section0.xml → lxml 파싱 → 트리 순회
+  ├── section*.xml → lxml 파싱 → 트리 순회 (다중 섹션 지원)
   │   ├── hp:p → 문단 → 마크다운 텍스트/제목
   │   ├── hp:tbl → 표 → 마크다운 테이블
   │   ├── hp:pic → 이미지 → ![ref](images/...)
-  │   └── hp:run/hp:t → 인라인 서식 적용
+  │   ├── hp:run/hp:t → 인라인 서식 적용
+  │   ├── hp:header/hp:footer → <!-- 머리글/꼬리글 -->
+  │   ├── hp:equation → $$ 수식 $$
+  │   ├── hp:rect/hp:drawText → > [글상자] text
+  │   ├── hp:checkBtn/radioBtn/comboBox/btn/edit → 양식 개체
+  │   ├── hp:footnote/hp:endnote → [^N] 인라인 참조
+  │   └── 섹션 간 --- 구분자
   ├── BinData/* → 이미지 추출 (BMP→PNG 변환)
   └── template_info.json → 페이지 설정/양식 메타 보존
 ```
@@ -580,12 +586,15 @@ hwpxlib 프로젝트(`github.com/neolord0/hwpxlib`)의 47개 테스트 HWPX 파�
 | SimplePicture.hwpx | 이미지 | `hp:pic` | ✅ 정상 | `![image1]()` |
 | MultiColumn.hwpx | 다단 | `hp:colPr colCount` | ✅ 텍스트 추출 | 다단 구조는 소실 |
 | ChangeTrack.hwpx | 변경 추적 | `hhs:*` | ⚠️ 일부만 | 9자만 추출 |
-| SimpleEquation.hwpx | **수식** | `hp:equation/hp:script` | ❌ 무시됨 | 0자 |
-| HeaderFooter.hwpx | **머리글/꼬리글** | `hp:header/hp:footer` | ❌ 무시됨 | 0자 |
-| SimpleComboBox.hwpx | **콤보박스** | `hp:comboBox` | ❌ 무시됨 | 0자 |
-| SimpleButtons.hwpx | **버튼/체크/라디오** | `hp:btn/hp:checkBtn/hp:radioBtn` | ❌ 무시됨 | 0자 |
-| SimpleRectangle.hwpx | **도형(글상자)** | `hp:rect/hp:drawText` | ❌ 무시됨 | "ABC" 텍스트 소실 |
+| SimpleEquation.hwpx | 수식 | `hp:equation/hp:script` | ✅ P1 구현 | `$$ script $$` |
+| HeaderFooter.hwpx | 머리글/꼬리글 | `hp:header/hp:footer` | ✅ P1 구현 | `<!-- 머리글: text -->` |
+| SimpleComboBox.hwpx | 콤보박스 | `hp:comboBox` | ✅ P2 구현 | `[콤보: name]` |
+| SimpleButtons.hwpx | 버튼/체크/라디오 | `hp:btn/hp:checkBtn/hp:radioBtn` | ✅ P2 구현 | `[ ] caption` |
+| SimpleRectangle.hwpx | 도형(글상자) | `hp:rect/hp:drawText` | ✅ P1 구현 | `> [글상자] ABC` |
+| SimpleEdit.hwpx | 입력란 | `hp:edit` | ✅ P2 구현 | `[입력란: name]` |
+| 3-section test.hwpx | 다중 섹션 | `section0~2.xml` | ✅ P2 구현 | `---` 구분자 |
 | 재난안전종합상황.hwpx | 대용량(7.3MB) | 복합 | ✅ 처리 | 1599줄 65KB |
+| **전체 25개** | **reader_writer 일괄** | — | ✅ **에러 0** | — |
 
 ### 12.2 미지원 기능의 XML 구조
 
@@ -617,20 +626,22 @@ hwpxlib 프로젝트(`github.com/neolord0/hwpxlib`)의 47개 테스트 HWPX 파�
 
 ### 12.3 개선 우선순위
 
-**P1 — 텍스트 손실 방지 (smart_replace에도 영향)**
-1. 도형/글상자 안 텍스트 (`hp:drawText` → `hp:subList`)
-2. 머리글/꼬리글 (`hp:header/hp:footer`)
-3. 수식 (`hp:script` → LaTeX 변환)
+**P1 — 텍스트 손실 방지 ✅ 완료 (커밋 1e16b9f)**
+1. ✅ 도형/글상자 안 텍스트 → `> [글상자] text`
+2. ✅ 머리글/꼬리글 → `<!-- 머리글: text -->`
+3. ✅ 수식 → `$$ script $$`
 
-**P2 — 양식 문서 지원**
-4. 체크박스/라디오 → `[ ] caption` / `[x] caption`
-5. 콤보박스/입력란 → `[ComboBox: value]`
-6. 각주/미주
+**P2 — 양식 문서 + 구조 확장 ✅ 완료 (커밋 caa49e8)**
+4. ✅ 체크박스/라디오 → `[ ] caption` / `[x] caption` / `(o) caption`
+5. ✅ 콤보박스/입력란/버튼 → `[콤보: name]` / `[입력란: name]` / `[버튼: caption]`
+6. ✅ 각주/미주 → 인라인 `[^N]` + 문서 끝 `[^N]: text`
+7. ✅ 다중 섹션 → section*.xml 자동 탐색, `---` 구분자
 
-**P3 — 구조 완성도**
-7. 다중 섹션 (section1.xml, section2.xml...)
+**P3 — 미지원 기능 (향후)**
 8. 하이퍼링크/책갈피
 9. 변경 추적
+10. 덧말(ruby text) / TextArt / OLE
+11. OWPML 2024 네임스페이스 호환 (`owpml.org/owpml/2024/*`)
 
 ### 12.4 smart_replace.py v2 개선 사항
 
