@@ -677,9 +677,12 @@ hwpxlib 프로젝트(`github.com/neolord0/hwpxlib`)의 47개 테스트 HWPX 파�
 16. ✅ smart_replace.py 2024 네임스페이스 + 다중 섹션 지원
 17. ✅ md_to_hwpx.py 다중 섹션 패치 지원
 
-**P5 — 미지원 기능 (향후)**
-18. 책갈피 (`hp:bookmark`)
-19. 탭/들여쓰기 정밀 변환
+**P5 — 잔여 기능 + 품질 ✅ 완료 (커밋 fa994ad)**
+18. ✅ 책갈피 (`hp:bookmarkStart`) → `<a id="name"></a>` 앵커
+19. ✅ 탭 (`hp:tab`) → 공백 4칸 변환
+20. ✅ smart_replace.py 일반 문단 텍스트 교체 지원
+21. ✅ pytest 테스트 스위트 (14 passed, 1 skipped)
+22. ✅ README.md 사용법 가이드 문서
 
 ### 12.4 smart_replace.py v2 개선 사항
 
@@ -692,6 +695,10 @@ v3 개선 (2025-02):
 - OWPML 2024 네임스페이스 자동 감지 (`NS_2011`/`NS_2024` 매핑)
 - 다중 섹션 지원 (`section0~N.xml` 전체 처리)
 - 동적 네임스페이스 접두사 감지 (`</hp:t>` 대신 실제 접두사 사용)
+
+v4 개선 (2025-02):
+- 일반 문단 텍스트 교체 지원 (`extract_xml_paragraphs()` + `parse_markdown_paragraphs()`)
+- 테이블 + 문단 동시 교체로 더 완전한 라운드트립
 
 ### 12.5 테스트 데이터
 
