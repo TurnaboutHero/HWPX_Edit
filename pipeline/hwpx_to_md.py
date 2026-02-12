@@ -454,10 +454,16 @@ class HwpxToMarkdown:
                 tag = etree.QName(child.tag).localname
                 if tag == 't':
                     raw_text = child.text or ''
-                    # 내부에 lineBreak, 변경 추적 등의 요소가 있을 수 있음
+                    # 내부에 lineBreak, 변경 추적, tab 등의 요소가 있을 수 있음
                     for sub in child:
                         sub_tag = etree.QName(sub.tag).localname
-                        if sub_tag == 'lineBreak':
+                        if sub_tag == 'tab':
+                            # 탭을 공백 4칸으로 변환
+                            raw_text += '    '
+                            if sub.tail:
+                                raw_text += sub.tail
+                            continue
+                        elif sub_tag == 'lineBreak':
                             raw_text += '\n'
                             if sub.tail:
                                 raw_text += sub.tail
@@ -542,6 +548,18 @@ class HwpxToMarkdown:
                 elif tag == 'fieldEnd':
                     # 하이퍼링크 필드 종료
                     hyperlink_url = None
+
+                elif tag == 'tab':
+                    # 탭 문자를 공백 4칸으로 변환
+                    parts.append('    ')
+
+                elif tag == 'bookmarkStart' or tag == 'bookmark':
+                    # 책갈피를 HTML 앵커로 변환
+                    bookmark_name = child.get('name', '')
+                    if bookmark_name:
+                        parts.append(f'<a id="{bookmark_name}"></a>')
+
+                # bookmarkEnd는 무시 (마크다운에서 범위 표현 불가)
 
         return ''.join(parts)
 
