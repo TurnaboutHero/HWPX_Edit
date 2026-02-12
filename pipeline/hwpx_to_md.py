@@ -78,6 +78,10 @@ class HwpxToMarkdown:
         self.style_map = None
         self.image_map = {}  # binaryItemIDRef -> extracted_filename
         self.template_info = {}  # 양식 보존용 메타데이터
+        self.footnotes = []  # (ref_num, text) 튜플 리스트
+        self.endnotes = []  # (ref_num, text) 튜플 리스트
+        self.footnote_counter = 0
+        self.endnote_counter = 0
 
     def convert(self):
         """메인 변환 함수. 마크다운 문자열 반환."""
@@ -91,16 +95,46 @@ class HwpxToMarkdown:
             if self.extract_images:
                 self._extract_images(z)
 
-            # 3. 본문(section0.xml) 파싱 및 변환
-            section_xml = z.read('Contents/section0.xml')
-            root = etree.fromstring(section_xml)
+            # 3. 다중 섹션 찾기 및 정렬
+            section_files = self._find_section_files(z)
 
-            # 4. 양식 템플릿 정보 보존
-            self._save_template_info(z, root)
+            # 4. 각 섹션 변환 및 병합
+            all_md_lines = []
+            first_section = True
 
-        # 5. 문서 트리 순회하며 마크다운 생성
-        md_lines = self._process_section(root)
-        return '\n'.join(md_lines)
+            for section_file in section_files:
+                section_xml = z.read(section_file)
+                root = etree.fromstring(section_xml)
+
+                # 첫 섹션에서 양식 정보 저장
+                if first_section:
+                    self._save_template_info(z, root)
+                    first_section = False
+
+                # 섹션 변환
+                md_lines = self._process_section(root)
+                all_md_lines.extend(md_lines)
+
+                # 섹션 구분자 추가 (마지막 섹션 제외)
+                if section_file != section_files[-1]:
+                    all_md_lines.append('')
+                    all_md_lines.append('---')
+                    all_md_lines.append('')
+
+        # 5. 각주/미주 정의 추가
+        if self.footnotes or self.endnotes:
+            all_md_lines.append('')
+            all_md_lines.append('')
+
+            if self.footnotes:
+                for ref_num, text in self.footnotes:
+                    all_md_lines.append(f"[^{ref_num}]: {text}")
+
+            if self.endnotes:
+                for ref_num, text in self.endnotes:
+                    all_md_lines.append(f"[^e{ref_num}]: {text}")
+
+        return '\n'.join(all_md_lines)
 
     def _extract_images(self, z):
         """BinData 폴더의 이미지를 추출"""
@@ -137,6 +171,22 @@ class HwpxToMarkdown:
 
                 self.image_map[ref_id] = out_name
 
+    def _find_section_files(self, z):
+        """ZIP 내부의 모든 section*.xml 파일을 찾아 정렬하여 반환"""
+        import re
+        section_files = []
+        pattern = re.compile(r'^Contents/section(\d+)\.xml$')
+
+        for name in z.namelist():
+            match = pattern.match(name)
+            if match:
+                section_num = int(match.group(1))
+                section_files.append((section_num, name))
+
+        # 번호 순서대로 정렬
+        section_files.sort(key=lambda x: x[0])
+        return [name for _, name in section_files]
+
     def _save_template_info(self, z, section_root):
         """양식 정보를 JSON으로 보존 (나중에 hwpx 복원 시 사용)"""
         info = {
@@ -163,6 +213,42 @@ class HwpxToMarkdown:
         info_path = os.path.join(self.output_dir, 'template_info.json')
         with open(info_path, 'w', encoding='utf-8') as f:
             json.dump(info, f, ensure_ascii=False, indent=2)
+
+    def _collect_footnotes_endnotes(self, para):
+        """문단에서 각주/미주를 수집하고 참조 번호 부여"""
+        # 각주 수집
+        for footnote in para.findall('.//hp:footnote', NS):
+            self.footnote_counter += 1
+            ref_num = self.footnote_counter
+
+            # 각주 텍스트 추출
+            footnote_texts = []
+            for sub_list in footnote.findall('.//hp:subList', NS):
+                for sub_para in sub_list.findall('.//hp:p', NS):
+                    text = self._extract_paragraph_text(sub_para)
+                    if text.strip():
+                        footnote_texts.append(text.strip())
+
+            if footnote_texts:
+                footnote_text = ' '.join(footnote_texts)
+                self.footnotes.append((ref_num, footnote_text))
+
+        # 미주 수집
+        for endnote in para.findall('.//hp:endnote', NS):
+            self.endnote_counter += 1
+            ref_num = self.endnote_counter
+
+            # 미주 텍스트 추출
+            endnote_texts = []
+            for sub_list in endnote.findall('.//hp:subList', NS):
+                for sub_para in sub_list.findall('.//hp:p', NS):
+                    text = self._extract_paragraph_text(sub_para)
+                    if text.strip():
+                        endnote_texts.append(text.strip())
+
+            if endnote_texts:
+                endnote_text = ' '.join(endnote_texts)
+                self.endnotes.append((ref_num, endnote_text))
 
     def _process_section(self, root):
         """섹션 루트 아래의 최상위 문단들을 순회"""
@@ -201,6 +287,9 @@ class HwpxToMarkdown:
         if self.style_map:
             heading_level = self.style_map.get_heading_level(para_pr_id)
 
+        # 각주/미주 수집
+        self._collect_footnotes_endnotes(para)
+
         # 테이블 감지 - 문단 내 테이블이 있으면 테이블로 처리
         tables = para.findall('.//hp:tbl', NS)
 
@@ -209,6 +298,14 @@ class HwpxToMarkdown:
 
         # 수식 감지
         equations = para.findall('.//hp:equation', NS)
+
+        # 양식 개체 감지
+        form_elements = []
+        form_elements.extend(para.findall('.//hp:checkBtn', NS))
+        form_elements.extend(para.findall('.//hp:radioBtn', NS))
+        form_elements.extend(para.findall('.//hp:comboBox', NS))
+        form_elements.extend(para.findall('.//hp:btn', NS))
+        form_elements.extend(para.findall('.//hp:edit', NS))
 
         # 도형/글상자 감지
         shape_tags = ['hp:rect', 'hp:ellipse', 'hp:arc', 'hp:polygon', 'hp:curve', 'hp:connectLine', 'hp:container']
@@ -251,6 +348,14 @@ class HwpxToMarkdown:
                 eq_line = self._process_equation(eq)
                 if eq_line:
                     lines.append(eq_line)
+        elif form_elements:
+            # 양식 개체가 있는 문단
+            if text.strip():
+                lines.append(text.strip())
+            for form_elem in form_elements:
+                form_line = self._process_form_element(form_elem)
+                if form_line:
+                    lines.append(form_line)
         elif text.strip():
             if heading_level:
                 lines.append(f"\n{'#' * heading_level} {text.strip()}\n")
@@ -268,6 +373,15 @@ class HwpxToMarkdown:
     def _extract_paragraph_text(self, para):
         """문단에서 인라인 텍스트 추출 (서식 포함)"""
         parts = []
+
+        # 각주/미주 요소를 미리 수집하여 인덱스 매핑 생성
+        all_footnotes = para.findall('.//hp:footnote', NS)
+        all_endnotes = para.findall('.//hp:endnote', NS)
+
+        # 현재 문단에서 각주/미주의 시작 번호 계산
+        footnote_start = self.footnote_counter - len(all_footnotes) + 1
+        endnote_start = self.endnote_counter - len(all_endnotes) + 1
+
         for run in para.findall('hp:run', NS):
             char_pr_id = run.get('charPrIDRef', '0')
             fmt = {}
@@ -289,6 +403,20 @@ class HwpxToMarkdown:
                     if raw_text:
                         formatted = self._apply_format(raw_text, fmt)
                         parts.append(formatted)
+
+                elif tag == 'ctrl':
+                    # 각주/미주 참조 삽입
+                    footnote = child.find('hp:footnote', NS)
+                    endnote = child.find('hp:endnote', NS)
+
+                    if footnote is not None and footnote in all_footnotes:
+                        idx = all_footnotes.index(footnote)
+                        ref_num = footnote_start + idx
+                        parts.append(f"[^{ref_num}]")
+                    elif endnote is not None and endnote in all_endnotes:
+                        idx = all_endnotes.index(endnote)
+                        ref_num = endnote_start + idx
+                        parts.append(f"[^e{ref_num}]")
 
         return ''.join(parts)
 
@@ -431,6 +559,45 @@ class HwpxToMarkdown:
         if script is not None and script.text:
             # 한글 수식 스크립트를 그대로 유지
             return f"\n$$\n{script.text.strip()}\n$$\n"
+        return None
+
+    def _process_form_element(self, element):
+        """양식 개체를 마크다운으로 변환"""
+        tag = etree.QName(element.tag).localname
+
+        caption = element.get('caption', '').strip()
+        name = element.get('name', '').strip()
+        value = element.get('value', 'UNCHECKED')
+
+        # caption이 비어있으면 name 사용
+        display_text = caption if caption else name
+
+        if tag == 'checkBtn':
+            # 체크박스: [ ] 또는 [x]
+            checked = 'x' if value == 'CHECKED' else ' '
+            return f"[{checked}] {display_text}"
+
+        elif tag == 'radioBtn':
+            # 라디오 버튼: ( ) 또는 (o)
+            checked = 'o' if value == 'CHECKED' else ' '
+            return f"({checked}) {display_text}"
+
+        elif tag == 'comboBox':
+            # 콤보박스: [콤보: name] 또는 [콤보: name = value]
+            selected = element.get('selectedValue', '').strip()
+            if selected:
+                return f"[콤보: {name} = {selected}]"
+            else:
+                return f"[콤보: {name}]"
+
+        elif tag == 'btn':
+            # 버튼: [버튼: caption]
+            return f"[버튼: {display_text}]"
+
+        elif tag == 'edit':
+            # 입력란: [입력란: name]
+            return f"[입력란: {name}]"
+
         return None
 
 
