@@ -199,8 +199,18 @@ def parse_markdown_paragraphs(md_text):
             i += 1
             continue
 
-        # 수식 블록 ($$)
+        # 수식 블록 ($$ ... $$) — 시작~끝 모두 건너뜀
         if stripped.startswith('$$'):
+            i += 1
+            # $$ 내부 줄도 건너뛰기
+            while i < len(lines) and not lines[i].strip().startswith('$$'):
+                i += 1
+            if i < len(lines):
+                i += 1  # 닫는 $$ 줄도 건너뜀
+            continue
+
+        # 각주/미주 정의 ([^N]: ...)
+        if re.match(r'^\[\^.+?\]:', stripped):
             i += 1
             continue
 
@@ -222,6 +232,8 @@ def parse_markdown_paragraphs(md_text):
             if stripped.startswith('|') or stripped.startswith('#') or \
                stripped.startswith('>') or stripped.startswith('![') or \
                stripped.startswith('<!--') or stripped.startswith('$$'):
+                break
+            if re.match(r'^\[\^.+?\]:', stripped):
                 break
             if re.match(r'^[-*_]{3,}\s*$', stripped):
                 break
@@ -267,8 +279,32 @@ def extract_xml_tables(section_root):
     return tables
 
 
+def _is_heading_para(para):
+    """hp:p가 제목(heading) 문단인지 휴리스틱으로 판별.
+
+    hwpx_to_md.py는 제목을 # 마크다운으로 변환하고,
+    parse_markdown_paragraphs는 #으로 시작하는 줄을 건너뛰므로
+    XML 쪽에서도 제목 문단을 건너뛰어야 정렬이 맞습니다.
+
+    판별 기준:
+      1. outlineLevel 속성이 있는 문단 (OWPML 표준 제목)
+      2. paraStyleIDRef가 '개요' 또는 'Heading'을 포함하는 문단
+    """
+    # 방법 1: paraPr의 outlineLevel 확인
+    for pr in para.findall('hp:paraPr', NS):
+        if pr.get('outlineLevel'):
+            return True
+
+    # 방법 2: styleIDRef 패턴 확인 (개요 1~9, Heading 1~9)
+    style_ref = para.get('styleIDRef', '')
+    if style_ref and re.match(r'(개요|Heading|heading)\s*\d', style_ref):
+        return True
+
+    return False
+
+
 def extract_xml_paragraphs(section_root):
-    """section XML에서 테이블을 포함하지 않는 최상위 문단 텍스트 추출.
+    """section XML에서 테이블/이미지/제목을 제외한 최상위 문단 텍스트 추출.
 
     hwpx_to_md.py의 _process_section()과 동일한 순서로 순회하여
     마크다운 문단과 1:1 매칭할 수 있도록 합니다.
@@ -283,6 +319,9 @@ def extract_xml_paragraphs(section_root):
             continue
         # 이미지를 포함한 문단은 건너뜀
         if para.findall('.//hp:pic', NS):
+            continue
+        # 제목 문단은 건너뜀 (마크다운에서 # 으로 변환되어 제외됨)
+        if _is_heading_para(para):
             continue
         text = _get_para_text(para)
         if not text.strip():
@@ -382,12 +421,51 @@ def _compute_text_diffs(old_text, new_text):
     return changes
 
 
+def _replace_in_text_node(raw_xml, old_frag, new_frag):
+    """텍스트 노드(> ... <) 내부에서만 프래그먼트를 교체.
+
+    XML 속성값이나 태그 이름이 아닌, 실제 텍스트 콘텐츠 안에서만
+    교체가 일어나도록 보장합니다.
+
+    Returns:
+        (modified_xml, success: bool)
+    """
+    start = 0
+    while True:
+        idx = raw_xml.find(old_frag, start)
+        if idx == -1:
+            return raw_xml, False
+
+        # 이 위치가 텍스트 노드 내부인지 확인
+        # 조건: idx 앞의 마지막 '>'와 idx 사이에 '<'가 없어야 함
+        last_gt = raw_xml.rfind('>', 0, idx)
+        if last_gt == -1:
+            start = idx + 1
+            continue
+
+        between = raw_xml[last_gt + 1:idx]
+        if '<' in between:
+            start = idx + 1
+            continue
+
+        # 프래그먼트가 태그 경계를 넘지 않는지 확인
+        frag_end = idx + len(old_frag)
+        next_lt = raw_xml.find('<', idx)
+        if next_lt != -1 and next_lt < frag_end:
+            start = idx + 1
+            continue
+
+        # 안전 — 텍스트 노드 내부에서 교체
+        raw_xml = raw_xml[:idx] + new_frag + raw_xml[frag_end:]
+        return raw_xml, True
+
+
 def apply_cell_replacements(raw_xml, replacements, close_tag='</hp:t>'):
     """원본 XML 문자열에서 테이블 셀 텍스트를 직접 치환.
 
     두 가지 전략을 순차적으로 시도:
       1. 전체 셀 텍스트 매칭 (단일 텍스트 태그 셀)
-      2. 프래그먼트 레벨 diff (멀티런 셀 — 변경된 단어만 교체)
+      2. 프래그먼트 레벨 diff (멀티런 셀 — 텍스트 노드 안에서만 교체)
 
     Args:
         raw_xml: 원본 section XML 문자열
@@ -412,14 +490,14 @@ def apply_cell_replacements(raw_xml, replacements, close_tag='</hp:t>'):
             continue
 
         # 전략 2: 프래그먼트 레벨 diff (멀티런 셀)
-        # 변경된 단어/구절만 찾아서 개별 교체
+        # 텍스트 노드 내부에서만 교체 (XML 속성/태그 보호)
         changes = _compute_text_diffs(old_text, new_text)
         sub_applied = 0
         for old_frag, new_frag in changes:
-            if not old_frag:
+            if not old_frag or len(old_frag) < 2:
                 continue
-            if old_frag in raw_xml:
-                raw_xml = raw_xml.replace(old_frag, new_frag, 1)
+            raw_xml, ok = _replace_in_text_node(raw_xml, old_frag, new_frag)
+            if ok:
                 sub_applied += 1
         if sub_applied > 0:
             applied += 1
