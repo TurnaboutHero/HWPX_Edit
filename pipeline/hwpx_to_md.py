@@ -10,14 +10,36 @@ import json
 from lxml import etree
 
 
-# HWPX XML 네임스페이스
-NS = {
+# HWPX XML 네임스페이스 — 2011 (한컴) / 2024 (OWPML 표준) 자동 감지
+NS_2011 = {
     'hp': 'http://www.hancom.co.kr/hwpml/2011/paragraph',
     'hs': 'http://www.hancom.co.kr/hwpml/2011/section',
     'hc': 'http://www.hancom.co.kr/hwpml/2011/core',
     'hh': 'http://www.hancom.co.kr/hwpml/2011/head',
     'ha': 'http://www.hancom.co.kr/hwpml/2011/app',
 }
+
+NS_2024 = {
+    'hp': 'http://www.owpml.org/owpml/2024/paragraph',
+    'hs': 'http://www.owpml.org/owpml/2024/body',      # 2024에서 section→body
+    'hc': 'http://www.owpml.org/owpml/2024/core',
+    'hh': 'http://www.owpml.org/owpml/2024/head',
+    'ha': 'http://www.owpml.org/owpml/2024/body',       # app→body 매핑
+    'hv': 'http://www.owpml.org/owpml/2024/version',
+    'hm': 'http://www.owpml.org/owpml/2024/master-page',
+    'hhs': 'http://www.owpml.org/owpml/2024/history',
+}
+
+# 기본값 (2011) — convert() 시 자동 감지하여 교체
+NS = dict(NS_2011)
+
+
+def detect_namespace_version(xml_bytes):
+    """XML 바이트에서 네임스페이스 버전 감지 (2011 vs 2024)"""
+    snippet = xml_bytes[:2000] if isinstance(xml_bytes, bytes) else xml_bytes.encode()[:2000]
+    if b'owpml.org/owpml/2024' in snippet:
+        return '2024'
+    return '2011'
 
 
 class HwpxStyleMap:
@@ -85,7 +107,17 @@ class HwpxToMarkdown:
 
     def convert(self):
         """메인 변환 함수. 마크다운 문자열 반환."""
+        global NS
         with zipfile.ZipFile(self.hwpx_path, 'r') as z:
+            # 0. 네임스페이스 버전 자동 감지 (인스턴스별)
+            section_files_raw = [n for n in z.namelist() if n.startswith('Contents/section')]
+            if section_files_raw:
+                sample_xml = z.read(section_files_raw[0])
+                ns_version = detect_namespace_version(sample_xml)
+                NS = NS_2024.copy() if ns_version == '2024' else NS_2011.copy()
+            else:
+                NS = NS_2011.copy()
+
             # 1. 헤더(스타일 정보) 파싱
             if 'Contents/header.xml' in z.namelist():
                 header_bytes = z.read('Contents/header.xml')
