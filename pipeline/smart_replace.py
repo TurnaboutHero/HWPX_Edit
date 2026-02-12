@@ -427,6 +427,36 @@ def apply_cell_replacements(raw_xml, replacements, close_tag='</hp:t>'):
     return raw_xml, applied
 
 
+def apply_para_replacements(raw_xml, replacements, close_tag='</hp:t>'):
+    """원본 XML 문자열에서 문단 텍스트를 직접 치환.
+
+    테이블 셀과 달리 프래그먼트 diff를 사용하지 않음.
+    전체 텍스트 매칭(>text</hp:t> 패턴)만 사용하여 XML 구조 파손을 방지.
+
+    Args:
+        raw_xml: 원본 section XML 문자열
+        replacements: [(old_text, new_text), ...] — XML 이스케이프된 텍스트
+        close_tag: 텍스트 태그 닫기 패턴
+
+    Returns:
+        (modified_xml, applied_count)
+    """
+    applied = 0
+    for old_text, new_text in replacements:
+        if not old_text or old_text == new_text:
+            continue
+
+        # 전체 텍스트 매칭만 사용 (프래그먼트 diff 금지 — XML 구조 보호)
+        old_pattern = f'>{old_text}{close_tag}'
+        new_pattern = f'>{new_text}{close_tag}'
+
+        if old_pattern in raw_xml:
+            raw_xml = raw_xml.replace(old_pattern, new_pattern, 1)
+            applied += 1
+
+    return raw_xml, applied
+
+
 # ============================================================
 # 메인 함수
 # ============================================================
@@ -628,10 +658,10 @@ def smart_replace(original_hwpx, edited_md, output_hwpx=None):
             raw_xml, cell_applied = apply_cell_replacements(raw_xml, cell_replacements, close_tag)
             total_applied += cell_applied
 
-        # 문단 텍스트 교체 (동일한 apply_cell_replacements 재활용)
+        # 문단 텍스트 교체 (전체 매칭만 — 프래그먼트 diff 금지)
         para_applied = 0
         if para_replacements:
-            raw_xml, para_applied = apply_cell_replacements(raw_xml, para_replacements, close_tag)
+            raw_xml, para_applied = apply_para_replacements(raw_xml, para_replacements, close_tag)
             total_para_applied += para_applied
 
         modified_sections[sec_filename] = raw_xml.encode('utf-8')
