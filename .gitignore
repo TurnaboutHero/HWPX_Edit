@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# 변환 출력물 (대용량, 재생성 가능)
+pipeline/output/images/
+pipeline/output/*.hwpx
+pipeline/output/template_info.json
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OMC state
+.omc/
+
+# 사업계획서 원본 (개인 문서)
+*.hwpx
+
+# 변환된 마크다운 (개인 내용 포함)
+pipeline/output/*.md
+
+# 임시 파일
+temp_extract/
+*.tmp
