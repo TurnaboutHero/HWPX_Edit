@@ -15,9 +15,10 @@ pipeline/output/template_info.json
 Thumbs.db
 desktop.ini
 
-# IDE
+# IDE / Tools
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 
