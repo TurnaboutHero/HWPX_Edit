@@ -45,3 +45,11 @@ images/
 
 # Windows 에이전트 부산물
 nul
+
+# 테스트 데이터 (hwpxlib 클론, 재생성 가능)
+test_data/hwpxlib/
+
+# 스크린샷
+변환후.png
+원본.png
+스마트 실행 오류.png
