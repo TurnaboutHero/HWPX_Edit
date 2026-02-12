@@ -29,56 +29,69 @@ def _patch_hwpx(output_path):
 
     z_in = zipfile.ZipFile(io.BytesIO(original_bytes), 'r')
 
-    if 'Contents/section0.xml' not in z_in.namelist():
+    # Contents/section*.xml 파일 찾기
+    section_pattern = re.compile(r'Contents/section\d+\.xml')
+    section_files = [name for name in z_in.namelist() if section_pattern.match(name)]
+
+    if not section_files:
         z_in.close()
         return False
 
-    sec_xml = z_in.read('Contents/section0.xml').decode('utf-8')
-    patched = False
+    patched_sections = {}
+    any_patched = False
 
-    # 패치 1: 빈 hp:subList에 빈 paragraph 주입
-    empty_sublist_pattern = r'(<hp:subList[^>]*>)(</hp:subList>)'
-    if re.search(empty_sublist_pattern, sec_xml):
-        # 문서에서 사용하는 paraPrIDRef 찾기 (첫 번째 hp:p에서 추출)
-        para_pr_match = re.search(r'<hp:p\s+paraPrIDRef="(\d+)"', sec_xml)
-        para_pr_id = para_pr_match.group(1) if para_pr_match else "0"
+    # 각 섹션 파일에 대해 패치 적용
+    for section_file in section_files:
+        sec_xml = z_in.read(section_file).decode('utf-8')
+        section_patched = False
 
-        empty_para = (
-            f'<hp:p paraPrIDRef="{para_pr_id}" styleIDRef="0"'
-            f' pageBreak="0" columnBreak="0" merged="0">'
-            f'<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run></hp:p>'
-        )
-        sec_xml = re.sub(empty_sublist_pattern, r'\1' + empty_para + r'\2', sec_xml)
-        patched = True
+        # 패치 1: 빈 hp:subList에 빈 paragraph 주입
+        empty_sublist_pattern = r'(<hp:subList[^>]*>)(</hp:subList>)'
+        if re.search(empty_sublist_pattern, sec_xml):
+            # 문서에서 사용하는 paraPrIDRef 찾기 (첫 번째 hp:p에서 추출)
+            para_pr_match = re.search(r'<hp:p\s+paraPrIDRef="(\d+)"', sec_xml)
+            para_pr_id = para_pr_match.group(1) if para_pr_match else "0"
 
-    # 패치 2: hp:tbl의 borderFillIDRef를 셀과 통일
-    # 첫 번째 hp:tc의 borderFillIDRef를 찾아서 hp:tbl에도 적용
-    tbl_pattern = r'(<hp:tbl[^>]*?)borderFillIDRef="(\d+)"([^>]*>)'
-    tc_bf_pattern = r'<hp:tc[^>]*borderFillIDRef="(\d+)"'
+            empty_para = (
+                f'<hp:p paraPrIDRef="{para_pr_id}" styleIDRef="0"'
+                f' pageBreak="0" columnBreak="0" merged="0">'
+                f'<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run></hp:p>'
+            )
+            sec_xml = re.sub(empty_sublist_pattern, r'\1' + empty_para + r'\2', sec_xml)
+            section_patched = True
 
-    for tbl_match in re.finditer(tbl_pattern, sec_xml):
-        tbl_bf_id = tbl_match.group(2)
-        # 이 테이블 이후 첫 번째 tc의 borderFillIDRef 찾기
-        rest = sec_xml[tbl_match.end():]
-        tc_match = re.search(tc_bf_pattern, rest)
-        if tc_match and tc_match.group(1) != tbl_bf_id:
-            cell_bf_id = tc_match.group(1)
-            old = tbl_match.group(0)
-            new = old.replace(f'borderFillIDRef="{tbl_bf_id}"',
-                              f'borderFillIDRef="{cell_bf_id}"')
-            sec_xml = sec_xml.replace(old, new, 1)
-            patched = True
+        # 패치 2: hp:tbl의 borderFillIDRef를 셀과 통일
+        # 첫 번째 hp:tc의 borderFillIDRef를 찾아서 hp:tbl에도 적용
+        tbl_pattern = r'(<hp:tbl[^>]*?)borderFillIDRef="(\d+)"([^>]*>)'
+        tc_bf_pattern = r'<hp:tc[^>]*borderFillIDRef="(\d+)"'
 
-    if not patched:
+        for tbl_match in re.finditer(tbl_pattern, sec_xml):
+            tbl_bf_id = tbl_match.group(2)
+            # 이 테이블 이후 첫 번째 tc의 borderFillIDRef 찾기
+            rest = sec_xml[tbl_match.end():]
+            tc_match = re.search(tc_bf_pattern, rest)
+            if tc_match and tc_match.group(1) != tbl_bf_id:
+                cell_bf_id = tc_match.group(1)
+                old = tbl_match.group(0)
+                new = old.replace(f'borderFillIDRef="{tbl_bf_id}"',
+                                  f'borderFillIDRef="{cell_bf_id}"')
+                sec_xml = sec_xml.replace(old, new, 1)
+                section_patched = True
+
+        if section_patched:
+            patched_sections[section_file] = sec_xml
+            any_patched = True
+
+    if not any_patched:
         z_in.close()
         return False
 
-    # 수정된 section0.xml을 ZIP에 다시 쓰기
+    # 수정된 섹션 파일들을 ZIP에 다시 쓰기
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z_out:
         for item in z_in.infolist():
-            if item.filename == 'Contents/section0.xml':
-                z_out.writestr(item.filename, sec_xml.encode('utf-8'))
+            if item.filename in patched_sections:
+                z_out.writestr(item.filename, patched_sections[item.filename].encode('utf-8'))
             elif item.filename == 'mimetype':
                 z_out.writestr(item, z_in.read(item.filename),
                                compress_type=zipfile.ZIP_STORED)

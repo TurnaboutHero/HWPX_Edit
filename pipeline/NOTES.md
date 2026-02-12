@@ -35,6 +35,18 @@ HWPX는 한컴오피스 한글의 개방형 문서 포맷으로, **ZIP 압축된
 | `hc` | `http://www.hancom.co.kr/hwpml/2011/core` | 이미지 데이터, 채우기 등 |
 | `hs` | `http://www.hancom.co.kr/hwpml/2011/section` | 섹션 루트 |
 
+**OWPML 2024 네임스페이스** (자동 감지):
+
+| 접두사 | URI | 용도 |
+|--------|-----|------|
+| `hp` | `http://www.owpml.org/owpml/2024/paragraph` | 문단, 텍스트런, 표, 이미지 |
+| `hh` | `http://www.owpml.org/owpml/2024/head` | 헤더(스타일 정의) |
+| `hc` | `http://www.owpml.org/owpml/2024/core` | 이미지 데이터, 채우기 등 |
+| `hs` | `http://www.owpml.org/owpml/2024/body` | 섹션(body로 변경) |
+| `hv` | `http://www.owpml.org/owpml/2024/version` | 버전 정보 |
+| `hm` | `http://www.owpml.org/owpml/2024/master-page` | 마스터 페이지 |
+| `hhs` | `http://www.owpml.org/owpml/2024/history` | 변경 이력 |
+
 ## 3. section0.xml 본문 구조
 
 ```xml
@@ -537,15 +549,20 @@ pypandoc-hwpx의 표 서식 손실 문제를 근본적으로 해결하기 위한
 ### 10.2 동작 원리
 
 ```
-원본.hwpx → section0.xml 파싱 → XML 블록 추출 (209개)
-편집된.md → 마크다운 파싱  → MD 블록 추출 (216개)
+원본.hwpx → section*.xml 파싱 → XML 블록 추출 (다중 섹션 지원)
+편집된.md → 마크다운 파싱  → MD 블록 추출
                 ↓
-        위치 기반 매칭 (178개 매칭)
+        위치 기반 매칭 (OWPML 2024 네임스페이스 자동 감지)
                 ↓
-    XML의 hp:t 텍스트만 교체 (91개 변경, 30개 표 업데이트)
+    XML의 hp:t 텍스트만 교체 (동적 네임스페이스 접두사 사용)
                 ↓
-        원본 HWPX + 수정된 section0.xml → 출력.hwpx
+        원본 HWPX + 수정된 section*.xml → 출력.hwpx
 ```
+
+**주요 기능**:
+- 다중 섹션 처리 (`section0~N.xml` 전체 처리)
+- OWPML 2024 네임스페이스 자동 감지 (`NS_2011`/`NS_2024` 매핑)
+- 동적 네임스페이스 접두사 감지 (실제 XML의 접두사 사용)
 
 ### 10.3 사용법
 
@@ -657,10 +674,12 @@ hwpxlib 프로젝트(`github.com/neolord0/hwpxlib`)의 47개 테스트 HWPX 파�
 **P4 — OWPML 2024 호환 ✅ 완료 (커밋 8f47702)**
 14. ✅ 네임스페이스 자동 감지 (`hancom.co.kr/2011` ↔ `owpml.org/2024`)
 15. ✅ NS_2011/NS_2024 매핑 테이블 분리, section→body 변경 대응
+16. ✅ smart_replace.py 2024 네임스페이스 + 다중 섹션 지원
+17. ✅ md_to_hwpx.py 다중 섹션 패치 지원
 
 **P5 — 미지원 기능 (향후)**
-16. 책갈피 (`hp:bookmark`)
-17. 탭/들여쓰기 정밀 변환
+18. 책갈피 (`hp:bookmark`)
+19. 탭/들여쓰기 정밀 변환
 
 ### 12.4 smart_replace.py v2 개선 사항
 
@@ -668,6 +687,11 @@ hwpxlib 프로젝트(`github.com/neolord0/hwpxlib`)의 47개 테스트 HWPX 파�
 - 전략 1: 전체 셀 텍스트 매칭 (단일 `hp:t` 셀)
 - 전략 2: `difflib.SequenceMatcher`로 변경 단어만 교체 (멀티런 셀)
 - `_normalize()`에서 `*` 제거 (마크다운 라운드트립 아티팩트 방지)
+
+v3 개선 (2025-02):
+- OWPML 2024 네임스페이스 자동 감지 (`NS_2011`/`NS_2024` 매핑)
+- 다중 섹션 지원 (`section0~N.xml` 전체 처리)
+- 동적 네임스페이스 접두사 감지 (`</hp:t>` 대신 실제 접두사 사용)
 
 ### 12.5 테스트 데이터
 

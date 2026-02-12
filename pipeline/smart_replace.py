@@ -22,18 +22,53 @@ import sys
 import argparse
 import zipfile
 import io
-import html
 import difflib
 from lxml import etree
 
 
-# HWPX XML 네임스페이스
-NS = {
+# HWPX XML 네임스페이스 — 2011 (한컴) / 2024 (OWPML 표준) 자동 감지
+NS_2011 = {
     'hp': 'http://www.hancom.co.kr/hwpml/2011/paragraph',
     'hs': 'http://www.hancom.co.kr/hwpml/2011/section',
     'hc': 'http://www.hancom.co.kr/hwpml/2011/core',
     'hh': 'http://www.hancom.co.kr/hwpml/2011/head',
 }
+
+NS_2024 = {
+    'hp': 'http://www.owpml.org/owpml/2024/paragraph',
+    'hs': 'http://www.owpml.org/owpml/2024/body',
+    'hc': 'http://www.owpml.org/owpml/2024/core',
+    'hh': 'http://www.owpml.org/owpml/2024/head',
+}
+
+# 기본값 (2011) — smart_replace() 시 자동 감지하여 교체
+NS = dict(NS_2011)
+
+
+def detect_namespace_version(xml_bytes):
+    """XML 바이트에서 네임스페이스 버전 감지 (2011 vs 2024)"""
+    snippet = xml_bytes[:2000] if isinstance(xml_bytes, bytes) else xml_bytes.encode()[:2000]
+    if b'owpml.org/owpml/2024' in snippet:
+        return '2024'
+    return '2011'
+
+
+def detect_close_tag(raw_xml):
+    """raw XML 문자열에서 텍스트 태그 닫기 패턴을 감지.
+
+    HWPX 2011은 </hp:t>, OWPML 2024는 </p:t> 또는 </owpml:t> 등
+    다양한 접두사를 사용할 수 있으므로, 실제 XML에서 사용되는 패턴을 감지.
+
+    Args:
+        raw_xml: section XML 문자열
+
+    Returns:
+        str: 감지된 닫기 태그 (예: '</hp:t>'). 감지 실패 시 '</hp:t>' 기본값.
+    """
+    m = re.search(r'</[\w]+:t>', raw_xml)
+    if m:
+        return m.group(0)
+    return '</hp:t>'
 
 
 # ============================================================
@@ -217,16 +252,17 @@ def _compute_text_diffs(old_text, new_text):
     return changes
 
 
-def apply_cell_replacements(raw_xml, replacements):
+def apply_cell_replacements(raw_xml, replacements, close_tag='</hp:t>'):
     """원본 XML 문자열에서 테이블 셀 텍스트를 직접 치환.
 
     두 가지 전략을 순차적으로 시도:
-      1. 전체 셀 텍스트 매칭 (단일 hp:t 태그 셀)
+      1. 전체 셀 텍스트 매칭 (단일 텍스트 태그 셀)
       2. 프래그먼트 레벨 diff (멀티런 셀 — 변경된 단어만 교체)
 
     Args:
-        raw_xml: 원본 section0.xml 문자열
+        raw_xml: 원본 section XML 문자열
         replacements: [(old_text, new_text), ...] — XML 이스케이프된 텍스트
+        close_tag: 텍스트 태그 닫기 패턴 (예: '</hp:t>', '</p:t>')
 
     Returns:
         (modified_xml, applied_count)
@@ -236,9 +272,9 @@ def apply_cell_replacements(raw_xml, replacements):
         if not old_text or old_text == new_text:
             continue
 
-        # 전략 1: 전체 텍스트 매칭 (단일 hp:run/hp:t 셀)
-        old_pattern = f'>{old_text}</hp:t>'
-        new_pattern = f'>{new_text}</hp:t>'
+        # 전략 1: 전체 텍스트 매칭 (단일 run/t 태그 셀)
+        old_pattern = f'>{old_text}{close_tag}'
+        new_pattern = f'>{new_text}{close_tag}'
 
         if old_pattern in raw_xml:
             raw_xml = raw_xml.replace(old_pattern, new_pattern, 1)
@@ -265,9 +301,29 @@ def apply_cell_replacements(raw_xml, replacements):
 # 메인 함수
 # ============================================================
 
+def _find_section_files(z):
+    """ZIP 내부의 모든 Contents/section*.xml 파일을 찾아 숫자순 정렬.
+
+    Args:
+        z: zipfile.ZipFile 객체
+
+    Returns:
+        list of (section_num, filename) — 숫자순 정렬된 튜플 리스트
+    """
+    pattern = re.compile(r'^Contents/section(\d+)\.xml$')
+    section_files = []
+    for name in z.namelist():
+        m = pattern.match(name)
+        if m:
+            section_files.append((int(m.group(1)), name))
+    section_files.sort(key=lambda x: x[0])
+    return section_files
+
+
 def smart_replace(original_hwpx, edited_md, output_hwpx=None):
     """원본 HWPX 구조를 보존하며 편집된 마크다운의 테이블 텍스트만 반영.
 
+    다중 섹션(section0.xml, section1.xml, ...)을 모두 처리합니다.
     원본 XML 바이트를 직접 조작하여 lxml 직렬화를 우회합니다.
     """
     if output_hwpx is None:
@@ -285,33 +341,68 @@ def smart_replace(original_hwpx, edited_md, output_hwpx=None):
     md_tables = parse_markdown_tables(md_text)
     print(f"  마크다운 테이블: {len(md_tables)}개")
 
-    # 2. 원본 HWPX에서 section0.xml 읽기 (raw bytes 보존)
+    # 2. 원본 HWPX에서 모든 section*.xml 찾기 (숫자순 정렬)
     with open(original_hwpx, 'rb') as f:
         hwpx_bytes = f.read()
 
     z_in = zipfile.ZipFile(io.BytesIO(hwpx_bytes), 'r')
 
-    if 'Contents/section0.xml' not in z_in.namelist():
-        print("오류: Contents/section0.xml을 찾을 수 없습니다.", file=sys.stderr)
+    section_files = _find_section_files(z_in)
+    if not section_files:
+        print("오류: Contents/section*.xml을 찾을 수 없습니다.", file=sys.stderr)
         z_in.close()
         sys.exit(1)
 
-    sec_xml_bytes = z_in.read('Contents/section0.xml')
-    raw_xml = sec_xml_bytes.decode('utf-8')
+    if len(section_files) > 1:
+        print(f"  섹션 파일: {len(section_files)}개 ({', '.join(f for _, f in section_files)})")
 
-    # 3. lxml으로 분석만 수행 (직렬화 안 함)
-    section_root = etree.fromstring(sec_xml_bytes)
-    xml_tables = extract_xml_tables(section_root)
-    print(f"  XML 테이블: {len(xml_tables)}개")
+    # 3. 각 섹션 읽기 및 테이블 추출 (네임스페이스는 첫 섹션에서 감지)
+    global NS
+    close_tag = '</hp:t>'  # 기본값 — 첫 섹션에서 감지하여 교체
 
-    # 4. 테이블 매칭 및 교체 목록 생성
-    replacements = []
+    # 섹션별 데이터: {filename: {'raw_xml': str, 'xml_tables': list, 'table_offset': int}}
+    section_data = {}
+    all_xml_tables = []  # 전체 테이블 (섹션 순서대로 이어붙임)
+    table_to_section = []  # 각 테이블이 속한 섹션 파일명
+
+    for idx, (sec_num, sec_filename) in enumerate(section_files):
+        sec_xml_bytes = z_in.read(sec_filename)
+        raw_xml = sec_xml_bytes.decode('utf-8')
+
+        # 첫 번째 섹션에서 네임스페이스 + 닫기 태그 감지
+        if idx == 0:
+            ns_ver = detect_namespace_version(sec_xml_bytes)
+            NS = NS_2024.copy() if ns_ver == '2024' else NS_2011.copy()
+            if ns_ver == '2024':
+                print(f"  네임스페이스: OWPML 2024 감지")
+            close_tag = detect_close_tag(raw_xml)
+
+        # lxml으로 분석만 수행 (직렬화 안 함)
+        section_root = etree.fromstring(sec_xml_bytes)
+        xml_tables = extract_xml_tables(section_root)
+
+        table_offset = len(all_xml_tables)
+        section_data[sec_filename] = {
+            'raw_xml': raw_xml,
+            'xml_tables': xml_tables,
+            'table_offset': table_offset,
+        }
+
+        for xt in xml_tables:
+            all_xml_tables.append(xt)
+            table_to_section.append(sec_filename)
+
+    print(f"  XML 테이블: {len(all_xml_tables)}개")
+
+    # 4. 테이블 매칭 및 섹션별 교체 목록 생성
+    # per_section_replacements: {filename: [(old_escaped, new_escaped), ...]}
+    per_section_replacements = {f: [] for _, f in section_files}
     matched = 0
     skipped = 0
 
-    min_count = min(len(xml_tables), len(md_tables))
+    min_count = min(len(all_xml_tables), len(md_tables))
     for i in range(min_count):
-        xt = xml_tables[i]
+        xt = all_xml_tables[i]
         mt = md_tables[i]
 
         # 타입 확인 (table↔table, quote↔quote)
@@ -323,6 +414,7 @@ def smart_replace(original_hwpx, edited_md, output_hwpx=None):
             continue
 
         matched += 1
+        sec_filename = table_to_section[i]
 
         # 각 셀 비교
         for row_idx in range(min(xt['row_cnt'], len(mt['cells']))):
@@ -338,26 +430,41 @@ def smart_replace(original_hwpx, edited_md, output_hwpx=None):
                     # XML 이스케이프
                     old_escaped = _xml_escape(old_text)
                     new_escaped = _xml_escape(new_text)
-                    replacements.append((old_escaped, new_escaped))
+                    per_section_replacements[sec_filename].append((old_escaped, new_escaped))
 
     print(f"  테이블 매칭: {matched}개, 건너뜀: {skipped}개")
-    print(f"  교체 대상 셀: {len(replacements)}개")
+    total_replacements = sum(len(v) for v in per_section_replacements.values())
+    print(f"  교체 대상 셀: {total_replacements}개")
 
-    # 5. 원본 XML 문자열에 직접 치환
-    if replacements:
-        raw_xml, applied = apply_cell_replacements(raw_xml, replacements)
-        print(f"  실제 적용: {applied}개")
+    # 5. 섹션별 원본 XML 문자열에 직접 치환
+    # modified_sections: {filename: modified_bytes} — 변경된 섹션만 포함
+    modified_sections = {}
+    total_applied = 0
+
+    for _, sec_filename in section_files:
+        replacements = per_section_replacements[sec_filename]
+        if not replacements:
+            continue
+
+        raw_xml = section_data[sec_filename]['raw_xml']
+        raw_xml, applied = apply_cell_replacements(raw_xml, replacements, close_tag)
+        total_applied += applied
+        modified_sections[sec_filename] = raw_xml.encode('utf-8')
+
+        if len(section_files) > 1:
+            print(f"    {sec_filename}: {applied}개 적용")
+
+    if total_applied > 0:
+        print(f"  실제 적용: {total_applied}개")
     else:
         print(f"  변경 사항 없음 — 원본 그대로 복사")
 
-    modified_bytes = raw_xml.encode('utf-8')
-
-    # 6. HWPX ZIP 재구성 (원본 파일 그대로 + section0.xml만 교체)
+    # 6. HWPX ZIP 재구성 (원본 파일 그대로 + 변경된 섹션만 교체)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z_out:
         for item in z_in.infolist():
-            if item.filename == 'Contents/section0.xml':
-                z_out.writestr(item.filename, modified_bytes)
+            if item.filename in modified_sections:
+                z_out.writestr(item.filename, modified_sections[item.filename])
             elif item.filename == 'mimetype':
                 z_out.writestr(item, z_in.read(item.filename),
                                compress_type=zipfile.ZIP_STORED)
