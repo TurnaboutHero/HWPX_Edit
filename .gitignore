@@ -33,3 +33,15 @@ pipeline/output/*.md
 # 임시 파일
 temp_extract/
 *.tmp
+
+# 테스트 출력물
+pipeline/output/
+test_output_*.md
+test_*_final.md
+
+# 생성된 파일
+template_info.json
+images/
+
+# Windows 에이전트 부산물
+nul

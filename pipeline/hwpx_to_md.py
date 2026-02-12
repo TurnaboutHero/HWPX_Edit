@@ -307,6 +307,15 @@ class HwpxToMarkdown:
         form_elements.extend(para.findall('.//hp:btn', NS))
         form_elements.extend(para.findall('.//hp:edit', NS))
 
+        # TextArt (글맵시) 감지
+        textarts = para.findall('.//hp:textart', NS)
+
+        # OLE 개체 감지
+        oles = para.findall('.//hp:ole', NS)
+
+        # 다단 레이아웃 감지
+        colprs = para.findall('.//hp:colPr', NS)
+
         # 도형/글상자 감지
         shape_tags = ['hp:rect', 'hp:ellipse', 'hp:arc', 'hp:polygon', 'hp:curve', 'hp:connectLine', 'hp:container']
         shapes_with_text = []
@@ -364,6 +373,24 @@ class HwpxToMarkdown:
         elif top_level:
             lines.append('')  # 빈 줄 보존
 
+        # 다단 레이아웃 메타데이터 삽입
+        for colpr in colprs:
+            colpr_line = self._process_colpr(colpr)
+            if colpr_line:
+                lines.append(colpr_line)
+
+        # TextArt (글맵시) 처리
+        for textart in textarts:
+            ta_line = self._process_textart(textart)
+            if ta_line:
+                lines.append(ta_line)
+
+        # OLE 개체 처리
+        for ole in oles:
+            ole_line = self._process_ole(ole)
+            if ole_line:
+                lines.append(ole_line)
+
         # 도형/글상자 텍스트 추가
         for shape_text in shapes_with_text:
             lines.append(f"> [글상자] {shape_text}")
@@ -382,6 +409,9 @@ class HwpxToMarkdown:
         footnote_start = self.footnote_counter - len(all_footnotes) + 1
         endnote_start = self.endnote_counter - len(all_endnotes) + 1
 
+        # 하이퍼링크 상태 추적
+        hyperlink_url = None
+
         for run in para.findall('hp:run', NS):
             char_pr_id = run.get('charPrIDRef', '0')
             fmt = {}
@@ -392,17 +422,52 @@ class HwpxToMarkdown:
                 tag = etree.QName(child.tag).localname
                 if tag == 't':
                     raw_text = child.text or ''
-                    # 내부에 lineBreak 같은 요소가 있을 수 있음
+                    # 내부에 lineBreak, 변경 추적 등의 요소가 있을 수 있음
                     for sub in child:
                         sub_tag = etree.QName(sub.tag).localname
                         if sub_tag == 'lineBreak':
                             raw_text += '\n'
-                        if sub.tail:
-                            raw_text += sub.tail
+                            if sub.tail:
+                                raw_text += sub.tail
+                            continue
+                        elif sub_tag == 'deleteBegin':
+                            # deleteBegin~deleteEnd 사이 텍스트는 취소선
+                            del_text = sub.tail or ''
+                            if del_text:
+                                # 앞뒤 공백을 ~~ 바깥으로 이동 (Markdown 호환)
+                                leading = del_text[:len(del_text) - len(del_text.lstrip())]
+                                trailing = del_text[len(del_text.rstrip()):]
+                                core = del_text.strip()
+                                if core:
+                                    raw_text += f'{leading}~~{core}~~{trailing}'
+                                else:
+                                    raw_text += del_text
+                            continue  # tail 이미 처리됨
+                        elif sub_tag == 'deleteEnd':
+                            if sub.tail:
+                                raw_text += sub.tail
+                            continue
+                        elif sub_tag == 'insertBegin':
+                            # insertBegin~insertEnd 사이 텍스트는 그대로 출력
+                            if sub.tail:
+                                raw_text += sub.tail
+                            continue
+                        elif sub_tag == 'insertEnd':
+                            if sub.tail:
+                                raw_text += sub.tail
+                            continue
+                        else:
+                            if sub.tail:
+                                raw_text += sub.tail
 
                     if raw_text:
                         formatted = self._apply_format(raw_text, fmt)
-                        parts.append(formatted)
+                        # 하이퍼링크 컨텍스트 내 텍스트면 링크로 감싸기
+                        if hyperlink_url:
+                            parts.append(f"[{formatted}]({hyperlink_url})")
+                            hyperlink_url = None  # URL 소비
+                        else:
+                            parts.append(formatted)
 
                 elif tag == 'ctrl':
                     # 각주/미주 참조 삽입
@@ -417,6 +482,34 @@ class HwpxToMarkdown:
                         idx = all_endnotes.index(endnote)
                         ref_num = endnote_start + idx
                         parts.append(f"[^e{ref_num}]")
+
+                elif tag == 'dutmal':
+                    # 덧말 (Ruby Text): <ruby>본말<rt>닷말</rt></ruby>
+                    main_el = child.find('hp:mainText', NS)
+                    sub_el = child.find('hp:subText', NS)
+                    main_text = main_el.text if main_el is not None and main_el.text else ''
+                    sub_text = sub_el.text if sub_el is not None and sub_el.text else ''
+                    if main_text:
+                        parts.append(f"<ruby>{main_text}<rt>{sub_text}</rt></ruby>")
+
+                elif tag == 'fieldBegin':
+                    # 하이퍼링크 필드 감지
+                    field_type = child.get('type', '')
+                    if field_type == 'HYPERLINK':
+                        # URL을 parameters에서 추출
+                        params = child.find('.//hp:parameters', NS)
+                        if params is not None:
+                            for sp in params.findall('hp:stringParam', NS):
+                                if sp.get('name') == 'url' and sp.text:
+                                    hyperlink_url = sp.text
+                                    break
+                        # 대체: href 속성에서도 시도
+                        if not hyperlink_url:
+                            hyperlink_url = child.get('href', '') or None
+
+                elif tag == 'fieldEnd':
+                    # 하이퍼링크 필드 종료
+                    hyperlink_url = None
 
         return ''.join(parts)
 
@@ -552,6 +645,43 @@ class HwpxToMarkdown:
                 texts.append(para_text.strip())
 
         return ' '.join(texts) if texts else None
+
+    def _process_textart(self, textart):
+        """TextArt (글맵시)를 마크다운으로 변환"""
+        text = textart.get('text', '')
+        if not text:
+            return None
+        # 특수 유니코드 CR/LF (U+240D, U+240A) 및 실제 \r\n을 공백으로
+        text = text.replace('\u240d\u240a', ' ')
+        text = text.replace('\u240d', ' ')
+        text = text.replace('\u240a', ' ')
+        text = text.replace('\r\n', ' ')
+        text = text.replace('\r', ' ')
+        text = text.replace('\n', ' ')
+        text = text.strip()
+        if text:
+            return f"> [글맵시] {text}"
+        return None
+
+    def _process_ole(self, ole):
+        """OLE 개체를 마크다운 주석으로 변환"""
+        binary_ref = ole.get('binaryItemIDRef', '')
+        # shapeComment에서 개체 정보 추출
+        comment_el = ole.find('hp:shapeComment', NS)
+        comment = ''
+        if comment_el is not None and comment_el.text:
+            comment = comment_el.text.strip().replace('\n', ' ').replace('\r', '')
+        if comment:
+            return f"<!-- OLE: {comment} ({binary_ref}) -->"
+        obj_type = ole.get('objectType', 'EMBEDDED')
+        return f"<!-- OLE: {obj_type} ({binary_ref}) -->"
+
+    def _process_colpr(self, colpr):
+        """다단 레이아웃 메타데이터를 마크다운 주석으로 변환"""
+        col_count = int(colpr.get('colCount', '1'))
+        if col_count > 1:
+            return f"<!-- [{col_count}단 레이아웃] -->"
+        return None
 
     def _process_equation(self, equation):
         """수식을 마크다운으로 변환"""
