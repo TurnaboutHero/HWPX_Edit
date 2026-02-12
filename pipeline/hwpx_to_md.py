@@ -167,9 +167,28 @@ class HwpxToMarkdown:
     def _process_section(self, root):
         """섹션 루트 아래의 최상위 문단들을 순회"""
         lines = []
+
+        # 1. 머리글 추출
+        headers = root.findall('.//hp:header', NS)
+        for header in headers:
+            header_text = self._extract_header_footer_text(header)
+            if header_text:
+                lines.append(f"<!-- 머리글: {header_text} -->")
+                lines.append('')
+
+        # 2. 본문 문단 처리
         for para in root.findall('hp:p', NS):
             para_lines = self._process_paragraph(para, top_level=True)
             lines.extend(para_lines)
+
+        # 3. 꼬리글 추출
+        footers = root.findall('.//hp:footer', NS)
+        for footer in footers:
+            footer_text = self._extract_header_footer_text(footer)
+            if footer_text:
+                lines.append('')
+                lines.append(f"<!-- 꼬리글: {footer_text} -->")
+
         return lines
 
     def _process_paragraph(self, para, top_level=False):
@@ -187,6 +206,19 @@ class HwpxToMarkdown:
 
         # 이미지 감지
         pics = para.findall('.//hp:pic', NS)
+
+        # 수식 감지
+        equations = para.findall('.//hp:equation', NS)
+
+        # 도형/글상자 감지
+        shape_tags = ['hp:rect', 'hp:ellipse', 'hp:arc', 'hp:polygon', 'hp:curve', 'hp:connectLine', 'hp:container']
+        shapes_with_text = []
+        for shape_tag in shape_tags:
+            shapes = para.findall(f'.//{shape_tag}', NS)
+            for shape in shapes:
+                shape_text = self._extract_shape_text(shape)
+                if shape_text:
+                    shapes_with_text.append(shape_text)
 
         # 텍스트 추출
         text = self._extract_paragraph_text(para)
@@ -211,6 +243,14 @@ class HwpxToMarkdown:
                     lines.append(img_line)
             if text.strip():
                 lines.insert(0, text.strip())
+        elif equations:
+            # 수식이 있는 문단
+            if text.strip():
+                lines.append(text.strip())
+            for eq in equations:
+                eq_line = self._process_equation(eq)
+                if eq_line:
+                    lines.append(eq_line)
         elif text.strip():
             if heading_level:
                 lines.append(f"\n{'#' * heading_level} {text.strip()}\n")
@@ -218,6 +258,10 @@ class HwpxToMarkdown:
                 lines.append(text.strip())
         elif top_level:
             lines.append('')  # 빈 줄 보존
+
+        # 도형/글상자 텍스트 추가
+        for shape_text in shapes_with_text:
+            lines.append(f"> [글상자] {shape_text}")
 
         return lines
 
@@ -357,6 +401,37 @@ class HwpxToMarkdown:
             filename = self.image_map[ref_id]
             return f"\n![{ref_id}](images/{filename})\n"
         return f"\n![{ref_id}](images/{ref_id})\n"
+
+    def _extract_header_footer_text(self, element):
+        """머리글/꼬리글에서 텍스트 추출"""
+        texts = []
+        for para in element.findall('.//hp:p', NS):
+            para_text = self._extract_paragraph_text(para)
+            if para_text.strip():
+                texts.append(para_text.strip())
+        return ' '.join(texts)
+
+    def _extract_shape_text(self, shape):
+        """도형/글상자 안의 텍스트 추출"""
+        draw_text = shape.find('.//hp:drawText', NS)
+        if draw_text is None:
+            return None
+
+        texts = []
+        for para in draw_text.findall('.//hp:p', NS):
+            para_text = self._extract_paragraph_text(para)
+            if para_text.strip():
+                texts.append(para_text.strip())
+
+        return ' '.join(texts) if texts else None
+
+    def _process_equation(self, equation):
+        """수식을 마크다운으로 변환"""
+        script = equation.find('.//hp:script', NS)
+        if script is not None and script.text:
+            # 한글 수식 스크립트를 그대로 유지
+            return f"\n$$\n{script.text.strip()}\n$$\n"
+        return None
 
 
 def convert_hwpx_to_md(hwpx_path, output_path=None, extract_images=True):
