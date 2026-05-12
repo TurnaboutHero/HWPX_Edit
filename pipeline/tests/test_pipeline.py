@@ -11,6 +11,8 @@ Run: cd D:\\Documents\\GitHub\\HWPX_Edit\\pipeline && python -m pytest tests/ -v
 import os
 import sys
 import re
+import shutil
+import uuid
 import pytest
 from pathlib import Path
 
@@ -34,7 +36,12 @@ from hwpx_to_md import (
     NS_2024,
 )
 from smart_replace import (
+    smart_replace,
     parse_markdown_tables,
+    parse_markdown_paragraphs,
+    collect_text_growth_warnings,
+    collect_protected_markup_changes,
+    validate_hwpx_integrity,
     detect_close_tag,
     detect_namespace_version as smart_detect_namespace,
     _normalize,
@@ -50,9 +57,12 @@ from md_to_hwpx import _patch_hwpx
 # ============================================================
 
 @pytest.fixture
-def tmp_output_dir(tmp_path):
+def tmp_output_dir():
     """Temporary output directory"""
-    return tmp_path / "output"
+    base_dir = PROJECT_ROOT / "work" / "pytest-output" / uuid.uuid4().hex
+    output_dir = base_dir / "output"
+    yield output_dir
+    shutil.rmtree(base_dir, ignore_errors=True)
 
 
 @pytest.fixture
@@ -404,6 +414,197 @@ Normal text
         assert len(tables[2]['cells']) == 2
         assert tables[2]['cells'][0] == ['X']
         assert tables[2]['cells'][1] == ['Y']
+
+
+    def test_parse_markdown_paragraphs_keeps_hwpx_line_mapping(self):
+        """Consecutive HWPX paragraph lines must not be merged."""
+        md_text = """**Title**
+**Question**
+**Answer**
+
+| A |
+| --- |
+| B |
+
+> Quote
+
+**Next answer**
+"""
+        paragraphs = parse_markdown_paragraphs(md_text)
+
+        assert paragraphs == [
+            '**Title**',
+            '**Question**',
+            '**Answer**',
+            '**Next answer**',
+        ]
+
+
+    def test_smart_replace_aborts_on_paragraph_count_mismatch(self, tmp_output_dir):
+        """Structural mismatch should fail instead of writing corrupt output."""
+        import zipfile
+
+        tmp_output_dir.mkdir(parents=True, exist_ok=True)
+        fake_hwpx = tmp_output_dir / "two_paragraphs.hwpx"
+        edited_md = tmp_output_dir / "edited.md"
+        output_hwpx = tmp_output_dir / "out.hwpx"
+
+        section_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hp:body xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+  <hp:p paraPrIDRef="1" styleIDRef="0"><hp:run charPrIDRef="0"><hp:t>one</hp:t></hp:run></hp:p>
+  <hp:p paraPrIDRef="1" styleIDRef="0"><hp:run charPrIDRef="0"><hp:t>two</hp:t></hp:run></hp:p>
+</hp:body>
+"""
+        with zipfile.ZipFile(fake_hwpx, 'w', zipfile.ZIP_DEFLATED) as z:
+            z.writestr('mimetype', 'application/hwp+zip', compress_type=zipfile.ZIP_STORED)
+            z.writestr('Contents/section0.xml', section_xml)
+        edited_md.write_text("one two\n", encoding='utf-8')
+
+        with pytest.raises(ValueError, match="문단 수"):
+            smart_replace(str(fake_hwpx), str(edited_md), str(output_hwpx))
+
+        assert not output_hwpx.exists()
+
+
+    def test_smart_replace_line_mapping_and_strip_lineseg(self, tmp_output_dir):
+        """Line-mapped paragraph replacement should update text and drop layout cache."""
+        import zipfile
+
+        tmp_output_dir.mkdir(parents=True, exist_ok=True)
+        fake_hwpx = tmp_output_dir / "line_mapping.hwpx"
+        edited_md = tmp_output_dir / "edited.md"
+        output_hwpx = tmp_output_dir / "out.hwpx"
+
+        section_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hp:body xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+  <hp:p paraPrIDRef="1" styleIDRef="0"><hp:run charPrIDRef="0"><hp:t>one</hp:t></hp:run><hp:linesegarray><hp:lineseg textpos="0"/></hp:linesegarray></hp:p>
+  <hp:p paraPrIDRef="1" styleIDRef="0"><hp:run charPrIDRef="0"><hp:t>two</hp:t></hp:run><hp:linesegarray><hp:lineseg textpos="0"/></hp:linesegarray></hp:p>
+</hp:body>
+"""
+        with zipfile.ZipFile(fake_hwpx, 'w', zipfile.ZIP_DEFLATED) as z:
+            z.writestr('mimetype', 'application/hwp+zip', compress_type=zipfile.ZIP_STORED)
+            z.writestr('Contents/section0.xml', section_xml)
+        edited_md.write_text("one\nsecond paragraph\n", encoding='utf-8')
+
+        smart_replace(str(fake_hwpx), str(edited_md), str(output_hwpx))
+
+        with zipfile.ZipFile(output_hwpx, 'r') as z:
+            patched_xml = z.read('Contents/section0.xml').decode('utf-8')
+
+        assert '<hp:t>second paragraph</hp:t>' in patched_xml
+        assert '<hp:linesegarray>' not in patched_xml
+
+        validation = validate_hwpx_integrity(str(output_hwpx), require_no_lineseg=True)
+        assert validation['ok'] is True
+        assert validation['section_count'] == 1
+        assert validation['linesegarray_count'] == 0
+
+
+    def test_collect_text_growth_warnings(self):
+        """Large text growth should be reported as layout risk."""
+        warnings = collect_text_growth_warnings(
+            ['짧은 답'],
+            ['이 답변은 기존보다 훨씬 길어져서 원래 답안 줄 안에 들어가지 않을 수 있습니다. '
+             '따라서 레이아웃 주의 항목으로 잡혀야 합니다.'],
+            kind='문단',
+            ratio_threshold=1.2,
+            delta_threshold=10,
+            width_threshold=20,
+        )
+
+        assert len(warnings) == 1
+        assert warnings[0]['kind'] == '문단'
+        assert warnings[0]['new_width'] > warnings[0]['old_width']
+
+
+    def test_collect_protected_markup_changes(self):
+        """Unsupported markup edits should be detected before conversion."""
+        changes = collect_protected_markup_changes(
+            "# Title\n![img](images/img)\nanswer\n",
+            "# Changed\n![other](images/other)\nanswer\n",
+        )
+
+        assert len(changes) == 2
+        assert changes[0]['old'] == '# Title'
+        assert changes[0]['new'] == '# Changed'
+
+        path_only_changes = collect_protected_markup_changes(
+            "![image1](images/image1)\nanswer\n",
+            "![image1](images/image1.png)\nanswer\n",
+        )
+        assert path_only_changes == []
+
+
+    def test_smart_replace_blocks_layout_risk_by_default(self, tmp_output_dir):
+        """Large text growth requires an explicit override."""
+        import zipfile
+
+        tmp_output_dir.mkdir(parents=True, exist_ok=True)
+        fake_hwpx = tmp_output_dir / "layout_risk.hwpx"
+        edited_md = tmp_output_dir / "edited.md"
+        output_hwpx = tmp_output_dir / "out.hwpx"
+
+        section_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hp:body xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+  <hp:p paraPrIDRef="1" styleIDRef="0"><hp:run charPrIDRef="0"><hp:t>짧은 답</hp:t></hp:run></hp:p>
+</hp:body>
+"""
+        long_answer = (
+            "이 답변은 기존보다 훨씬 길어져서 원래 답안 줄 안에 들어가지 않을 수 있습니다. "
+            "따라서 기본 정책에서는 파일 생성을 중단해야 합니다. "
+            "사용자가 명시적으로 허용하지 않는 한 긴 문장으로 인한 페이지 흐름 변경을 막아야 합니다. "
+            "이 문장은 테스트 임계값을 넘기기 위해 충분히 길게 작성되었습니다."
+        )
+        with zipfile.ZipFile(fake_hwpx, 'w', zipfile.ZIP_DEFLATED) as z:
+            z.writestr('mimetype', 'application/hwp+zip', compress_type=zipfile.ZIP_STORED)
+            z.writestr('Contents/section0.xml', section_xml)
+        edited_md.write_text(long_answer + "\n", encoding='utf-8')
+
+        with pytest.raises(ValueError, match="레이아웃 위험"):
+            smart_replace(str(fake_hwpx), str(edited_md), str(output_hwpx))
+
+        assert not output_hwpx.exists()
+
+        smart_replace(
+            str(fake_hwpx),
+            str(edited_md),
+            str(output_hwpx),
+            allow_layout_risk=True,
+        )
+        assert output_hwpx.exists()
+
+
+    def test_smart_replace_blocks_protected_markup_edits(self, tmp_output_dir):
+        """Heading/image/form-like lines are not silently ignored."""
+        import zipfile
+
+        tmp_output_dir.mkdir(parents=True, exist_ok=True)
+        fake_hwpx = tmp_output_dir / "heading.hwpx"
+        edited_md = tmp_output_dir / "edited.md"
+        output_hwpx = tmp_output_dir / "out.hwpx"
+
+        header_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:paraPr id="1"><hh:heading type="OUTLINE" level="0"/></hh:paraPr>
+  <hh:charPr id="0"><hh:fontRef hangul="0" latin="0" hanja="0" japanese="0" other="0" symbol="0" user="0"/></hh:charPr>
+</hh:head>
+"""
+        section_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hp:body xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+  <hp:p paraPrIDRef="1" styleIDRef="0"><hp:run charPrIDRef="0"><hp:t>Original title</hp:t></hp:run></hp:p>
+  <hp:p paraPrIDRef="2" styleIDRef="0"><hp:run charPrIDRef="0"><hp:t>body</hp:t></hp:run></hp:p>
+</hp:body>
+"""
+        with zipfile.ZipFile(fake_hwpx, 'w', zipfile.ZIP_DEFLATED) as z:
+            z.writestr('mimetype', 'application/hwp+zip', compress_type=zipfile.ZIP_STORED)
+            z.writestr('Contents/header.xml', header_xml)
+            z.writestr('Contents/section0.xml', section_xml)
+        edited_md.write_text("# Changed title\nbody\n", encoding='utf-8')
+
+        with pytest.raises(ValueError, match="이미지, 제목"):
+            smart_replace(str(fake_hwpx), str(edited_md), str(output_hwpx))
+
+        assert not output_hwpx.exists()
 
 
     def test_detect_close_tag(self):

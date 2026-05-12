@@ -69,6 +69,11 @@ def main():
             value=True,
             help="텍스트가 겹쳐 보이는 문제를 방지합니다"
         )
+        allow_layout_risk = st.checkbox(
+            "긴 텍스트 레이아웃 위험 허용",
+            value=False,
+            help="긴 텍스트로 페이지 흐름이 바뀔 수 있음을 확인한 경우에만 켜세요"
+        )
 
         if uploaded_file is not None:
             # 파일이 변경되었는지 확인
@@ -194,10 +199,46 @@ def main():
                 with col4:
                     st.metric("변경된 문단", f"{changes['paragraph_changes']}개")
 
+                structure_ok = changes['table_count_match'] and changes['paragraph_count_match']
+                if not structure_ok:
+                    st.error(
+                        "원본과 편집본의 구조가 다릅니다. "
+                        f"테이블 {changes['total_tables']}→{changes['edited_tables']}개, "
+                        f"문단 {changes['total_paragraphs']}→{changes['edited_paragraphs']}개입니다. "
+                        "HWPX 생성을 하려면 원본과 같은 줄/테이블 구조를 유지하세요."
+                    )
+
+                protected_ok = not changes['protected_changes']
+                if not protected_ok:
+                    st.error(
+                        "현재 자동 반영하지 않는 이미지/제목/글상자/OLE/수식/양식 라인이 변경되었습니다."
+                    )
+                    with st.expander("보호된 라인 변경"):
+                        for warning in changes['protected_changes'][:10]:
+                            st.write(f"- {warning}")
+                        if len(changes['protected_changes']) > 10:
+                            st.write(f"- 외 {len(changes['protected_changes']) - 10}개")
+
+                layout_ok = not changes['layout_warnings'] or allow_layout_risk
+                if changes['layout_warnings']:
+                    st.warning(
+                        "텍스트가 크게 길어진 항목이 있어 기본 상태에서는 HWPX 생성을 막습니다."
+                    )
+                    with st.expander("레이아웃 주의 항목"):
+                        for warning in changes['layout_warnings'][:10]:
+                            st.write(f"- {warning}")
+                        if len(changes['layout_warnings']) > 10:
+                            st.write(f"- 외 {len(changes['layout_warnings']) - 10}개")
+
                 st.divider()
 
                 # HWPX 생성 버튼
-                if st.button("🔨 HWPX 생성", type="primary", use_container_width=True):
+                if st.button(
+                    "🔨 HWPX 생성",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not (structure_ok and protected_ok and layout_ok),
+                ):
                     with st.spinner("HWPX 파일 생성 중..."):
                         try:
                             # 임시 마크다운 파일 저장
@@ -213,7 +254,9 @@ def main():
                             result = st.session_state.service.smart_replace(
                                 st.session_state.temp_hwpx_path,
                                 tmp_md_path,
-                                output_hwpx
+                                output_hwpx,
+                                strip_lineseg=strip_lineseg,
+                                allow_layout_risk=allow_layout_risk
                             )
 
                             if result['success']:

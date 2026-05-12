@@ -24,6 +24,7 @@ import argparse
 import zipfile
 import io
 import difflib
+import tempfile
 from lxml import etree
 
 
@@ -135,10 +136,14 @@ def _parse_table_lines(table_lines):
 
 
 def parse_markdown_paragraphs(md_text):
-    """마크다운에서 일반 텍스트 문단만 순서대로 추출.
+    """마크다운에서 일반 텍스트 문단을 순서대로 추출.
 
-    테이블 행, 제목, 이미지, 인용문, 빈 줄, 구분선, HTML 주석 등을 제외하고
-    연속된 일반 텍스트 줄을 하나의 문단으로 합칩니다.
+    ``hwpx_to_md.py``는 HWPX 문단 하나를 Markdown 한 줄로 내보냅니다.
+    smart_replace는 원본 XML 문단과 1:1로 맞춰야 하므로, 연속된 줄을
+    임의로 합치지 않고 비어 있지 않은 일반 텍스트 줄 하나를 문단 하나로
+    취급합니다. 사용자가 줄을 수동으로 감싸서 문단 수가 달라지면
+    smart_replace 단계에서 중단되어 잘못된 위치에 텍스트가 들어가지 않게
+    합니다.
 
     Returns:
         list of str: 문단 텍스트 목록
@@ -222,33 +227,113 @@ def parse_markdown_paragraphs(md_text):
             i += 1
             continue
 
-        # 일반 텍스트 줄 — 연속된 줄을 하나의 문단으로 합침
-        para_lines = []
-        while i < len(lines):
-            line = lines[i]
-            stripped = line.strip()
-            if not stripped:
-                break
-            if stripped.startswith('|') or stripped.startswith('#') or \
-               stripped.startswith('>') or stripped.startswith('![') or \
-               stripped.startswith('<!--') or stripped.startswith('$$'):
-                break
-            if re.match(r'^\[\^.+?\]:', stripped):
-                break
-            if re.match(r'^[-*_]{3,}\s*$', stripped):
-                break
-            # 다음 줄이 테이블 구분선이면 현재 줄은 테이블 헤더
-            if '|' in stripped and i + 1 < len(lines):
-                next_stripped = lines[i + 1].strip()
-                if re.match(r'^\|[\s\-:|]+\|$', next_stripped):
-                    break
-            para_lines.append(stripped)
-            i += 1
-
-        if para_lines:
-            paragraphs.append(' '.join(para_lines))
+        paragraphs.append(stripped)
+        i += 1
 
     return paragraphs
+
+
+def parse_protected_markdown_lines(md_text):
+    """smart_replace가 직접 반영하지 않는 Markdown 라인을 추출.
+
+    이미지, 제목, 글상자/글맵시 인용 라인, OLE/메타 주석, 수식 블록,
+    양식 개체 등은 현재 텍스트 치환 대상이 아닙니다. 이런 줄이 바뀌면
+    조용히 무시하지 않고 중단하기 위해 원본/편집본 비교에 사용합니다.
+    """
+    protected = []
+    lines = md_text.split('\n')
+    i = 0
+    in_table = False
+    in_equation = False
+
+    while i < len(lines):
+        stripped = lines[i].strip()
+
+        if not stripped:
+            in_table = False
+            i += 1
+            continue
+
+        if in_equation:
+            protected.append(stripped)
+            if stripped.startswith('$$'):
+                in_equation = False
+            i += 1
+            continue
+
+        if stripped.startswith('$$'):
+            protected.append(stripped)
+            if stripped.count('$$') == 1:
+                in_equation = True
+            i += 1
+            continue
+
+        if stripped.startswith('|') or (in_table and '|' in stripped):
+            in_table = True
+            i += 1
+            continue
+
+        if '|' in stripped and i + 1 < len(lines):
+            next_stripped = lines[i + 1].strip()
+            if re.match(r'^\|[\s\-:|]+\|$', next_stripped):
+                in_table = True
+                i += 1
+                continue
+
+        in_table = False
+
+        if (
+            stripped.startswith('#') or
+            stripped.startswith('>') or
+            stripped.startswith('![') or
+            stripped.startswith('<!--') or
+            re.match(r'^[-*_]{3,}\s*$', stripped) or
+            re.match(r'^\[\^.+?\]:', stripped) or
+            re.match(r'^\[[ x]\]\s', stripped) or
+            re.match(r'^\([ o]\)\s', stripped) or
+            re.match(r'^\[(콤보|버튼|입력란):', stripped)
+        ):
+            protected.append(stripped)
+
+        i += 1
+
+    return protected
+
+
+def _normalize_protected_markdown_line(line):
+    """비교용 보호 라인 정규화."""
+    image_match = re.match(r'^!\[([^\]]*)\]\([^)]+\)$', line)
+    if image_match:
+        return f"![{image_match.group(1)}]"
+    return line
+
+
+def collect_protected_markup_changes(original_md, edited_md):
+    """지원하지 않는 Markdown 라인 변경 사항을 찾습니다."""
+    original_lines = [
+        _normalize_protected_markdown_line(line)
+        for line in parse_protected_markdown_lines(original_md)
+    ]
+    edited_lines = [
+        _normalize_protected_markdown_line(line)
+        for line in parse_protected_markdown_lines(edited_md)
+    ]
+
+    if original_lines == edited_lines:
+        return []
+
+    changes = []
+    max_len = max(len(original_lines), len(edited_lines))
+    for idx in range(max_len):
+        old = original_lines[idx] if idx < len(original_lines) else ''
+        new = edited_lines[idx] if idx < len(edited_lines) else ''
+        if old != new:
+            changes.append({
+                'index': idx + 1,
+                'old': old,
+                'new': new,
+            })
+    return changes
 
 
 # ============================================================
@@ -403,6 +488,80 @@ def _xml_escape(text):
     return text
 
 
+def _display_width(text):
+    """대략적인 표시 폭 계산.
+
+    정확한 조판 폭은 글꼴/크기/문단 폭에 따라 달라지지만, CJK 문자는
+    영문보다 넓게 잡아 긴 답변 리스크를 보수적으로 감지합니다.
+    """
+    width = 0
+    for ch in text:
+        width += 2 if ord(ch) > 127 else 1
+    return width
+
+
+def collect_text_growth_warnings(old_items, new_items, kind='문단',
+                                 ratio_threshold=1.6, delta_threshold=60,
+                                 width_threshold=180):
+    """텍스트 길이 증가로 레이아웃이 밀릴 가능성이 큰 항목을 찾습니다.
+
+    Returns:
+        list of dict: index, kind, old_width, new_width, delta, ratio, preview
+    """
+    warnings = []
+    for idx, (old_text, new_text) in enumerate(zip(old_items, new_items), 1):
+        old_plain = _strip_md_format(old_text)
+        new_plain = _strip_md_format(new_text)
+        old_width = _display_width(old_plain)
+        new_width = _display_width(new_plain)
+        delta = new_width - old_width
+        ratio = (new_width / old_width) if old_width else float('inf')
+
+        if new_width >= width_threshold and delta >= delta_threshold and ratio >= ratio_threshold:
+            warnings.append({
+                'index': idx,
+                'kind': kind,
+                'old_width': old_width,
+                'new_width': new_width,
+                'delta': delta,
+                'ratio': ratio,
+                'preview': new_plain[:80],
+            })
+
+    return warnings
+
+
+def format_growth_warning(warning):
+    """길이 증가 경고를 CLI/대시보드 공통 메시지로 변환."""
+    ratio = warning['ratio']
+    ratio_text = '∞' if ratio == float('inf') else f"{ratio:.1f}배"
+    return (
+        f"{warning['kind']} #{warning['index']}: "
+        f"폭 {warning['old_width']} -> {warning['new_width']} "
+        f"(+{warning['delta']}, {ratio_text})"
+    )
+
+
+def format_protected_markup_change(change):
+    """지원하지 않는 Markdown 변경 경고를 메시지로 변환."""
+    old = change['old'] or '(없음)'
+    new = change['new'] or '(없음)'
+    return f"보호 라인 #{change['index']}: {old[:60]} -> {new[:60]}"
+
+
+def render_original_markdown_for_checks(hwpx_path):
+    """원본 HWPX를 Markdown으로 렌더링해 보호 라인 비교에 사용."""
+    from hwpx_to_md import HwpxToMarkdown
+
+    with tempfile.TemporaryDirectory(prefix='hwpx_check_') as tmp_dir:
+        converter = HwpxToMarkdown(
+            hwpx_path,
+            output_dir=tmp_dir,
+            extract_images=False,
+        )
+        return converter.convert()
+
+
 # ============================================================
 # 원본 XML 문자열에 직접 텍스트 치환
 # ============================================================
@@ -509,7 +668,9 @@ def apply_para_replacements(raw_xml, replacements, close_tag='</hp:t>'):
     """원본 XML 문자열에서 문단 텍스트를 직접 치환.
 
     테이블 셀과 달리 프래그먼트 diff를 사용하지 않음.
-    전체 텍스트 매칭(>text</hp:t> 패턴)만 사용하여 XML 구조 파손을 방지.
+    문단 전체 텍스트가 하나의 텍스트 노드 안에 있을 때만 교체하여
+    XML 구조 파손을 방지합니다. 텍스트 뒤에 ``hp:tab`` 같은 자식 태그가
+    붙어 있어도 텍스트 노드 내부의 실제 문장만 교체합니다.
 
     Args:
         raw_xml: 원본 section XML 문자열
@@ -524,15 +685,115 @@ def apply_para_replacements(raw_xml, replacements, close_tag='</hp:t>'):
         if not old_text or old_text == new_text:
             continue
 
-        # 전체 텍스트 매칭만 사용 (프래그먼트 diff 금지 — XML 구조 보호)
-        old_pattern = f'>{old_text}{close_tag}'
-        new_pattern = f'>{new_text}{close_tag}'
-
-        if old_pattern in raw_xml:
-            raw_xml = raw_xml.replace(old_pattern, new_pattern, 1)
+        raw_xml, ok = _replace_in_text_node(raw_xml, old_text, new_text)
+        if ok:
             applied += 1
 
     return raw_xml, applied
+
+
+def strip_linesegarray(hwpx_path):
+    """HWPX 파일에서 section XML의 linesegarray 태그를 제거.
+
+    linesegarray는 줄 배치 캐시입니다. 텍스트 길이가 바뀐 뒤에도 남아 있으면
+    한글에서 예전 줄 위치를 재사용해 글자가 겹쳐 보일 수 있습니다.
+    제거하면 한글이 문서를 열 때 줄 배치를 다시 계산합니다.
+
+    Returns:
+        int: 제거된 linesegarray 태그 수
+    """
+    with open(hwpx_path, 'rb') as f:
+        original_bytes = f.read()
+
+    z_in = zipfile.ZipFile(io.BytesIO(original_bytes), 'r')
+    removed_count = 0
+    modified_sections = {}
+
+    for item in z_in.infolist():
+        if not re.match(r'^Contents/section\d+\.xml$', item.filename):
+            continue
+
+        raw_xml = z_in.read(item.filename).decode('utf-8')
+        modified_xml, count = re.subn(
+            r'<[\w]+:linesegarray[^>]*>.*?</[\w]+:linesegarray>',
+            '',
+            raw_xml,
+            flags=re.DOTALL,
+        )
+        modified_xml, self_closing_count = re.subn(
+            r'<[\w]+:linesegarray[^>]*/>',
+            '',
+            modified_xml,
+        )
+        count += self_closing_count
+
+        if count:
+            removed_count += count
+            modified_sections[item.filename] = modified_xml.encode('utf-8')
+
+    if not modified_sections:
+        z_in.close()
+        return 0
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z_out:
+        for item in z_in.infolist():
+            if item.filename in modified_sections:
+                z_out.writestr(item, modified_sections[item.filename])
+            elif item.filename == 'mimetype':
+                z_out.writestr(item, z_in.read(item.filename),
+                               compress_type=zipfile.ZIP_STORED)
+            else:
+                z_out.writestr(item, z_in.read(item.filename))
+    z_in.close()
+
+    with open(hwpx_path, 'wb') as f:
+        f.write(buf.getvalue())
+
+    return removed_count
+
+
+def validate_hwpx_integrity(hwpx_path, require_no_lineseg=False):
+    """HWPX 산출물이 다시 열리고 section XML이 파싱되는지 검증."""
+    result = {
+        'ok': True,
+        'errors': [],
+        'section_count': 0,
+        'linesegarray_count': 0,
+    }
+
+    try:
+        with zipfile.ZipFile(hwpx_path, 'r') as z:
+            bad_member = z.testzip()
+            if bad_member:
+                result['errors'].append(f'ZIP 멤버 손상: {bad_member}')
+            section_files = _find_section_files(z)
+            result['section_count'] = len(section_files)
+
+            if not section_files:
+                result['errors'].append('Contents/section*.xml 파일이 없습니다.')
+
+            for _, section_file in section_files:
+                raw_xml = z.read(section_file)
+                try:
+                    etree.fromstring(raw_xml)
+                except etree.XMLSyntaxError as exc:
+                    result['errors'].append(f'{section_file} XML 파싱 실패: {exc}')
+
+                raw_text = raw_xml.decode('utf-8')
+                result['linesegarray_count'] += len(
+                    re.findall(r'<[\w]+:linesegarray\b', raw_text)
+                )
+
+            if require_no_lineseg and result['linesegarray_count'] > 0:
+                result['errors'].append(
+                    f"linesegarray가 {result['linesegarray_count']}개 남아 있습니다."
+                )
+    except Exception as exc:
+        result['errors'].append(f'HWPX ZIP 검증 실패: {exc}')
+
+    result['ok'] = not result['errors']
+    return result
 
 
 # ============================================================
@@ -558,7 +819,8 @@ def _find_section_files(z):
     return section_files
 
 
-def smart_replace(original_hwpx, edited_md, output_hwpx=None):
+def smart_replace(original_hwpx, edited_md, output_hwpx=None, strip_lineseg=True,
+                  allow_layout_risk=False):
     """원본 HWPX 구조를 보존하며 편집된 마크다운의 텍스트를 반영.
 
     테이블 셀 텍스트와 일반 문단 텍스트를 모두 교체합니다.
@@ -580,6 +842,19 @@ def smart_replace(original_hwpx, edited_md, output_hwpx=None):
     md_tables = parse_markdown_tables(md_text)
     md_paragraphs = parse_markdown_paragraphs(md_text)
     print(f"  마크다운 테이블: {len(md_tables)}개, 문단: {len(md_paragraphs)}개")
+
+    original_md_for_checks = render_original_markdown_for_checks(original_hwpx)
+    protected_changes = collect_protected_markup_changes(original_md_for_checks, md_text)
+    if protected_changes:
+        print("  보호된 Markdown 라인이 변경되었습니다:")
+        for change in protected_changes[:5]:
+            print(f"    - {format_protected_markup_change(change)}")
+        if len(protected_changes) > 5:
+            print(f"    - 외 {len(protected_changes) - 5}개")
+        raise ValueError(
+            "현재 smart_replace는 이미지, 제목, 글상자, OLE, 수식, 양식 개체 "
+            "변경을 반영하지 않습니다. 해당 라인을 원본과 같게 유지하세요."
+        )
 
     # 2. 원본 HWPX에서 모든 section*.xml 찾기 (숫자순 정렬)
     with open(original_hwpx, 'rb') as f:
@@ -643,6 +918,51 @@ def smart_replace(original_hwpx, edited_md, output_hwpx=None):
             para_to_section.append(sec_filename)
 
     print(f"  XML 테이블: {len(all_xml_tables)}개, 문단: {len(all_xml_paragraphs)}개")
+
+    if len(md_tables) != len(all_xml_tables):
+        z_in.close()
+        raise ValueError(
+            "테이블 수가 원본과 편집본에서 다릅니다. "
+            f"원본 XML={len(all_xml_tables)}개, Markdown={len(md_tables)}개. "
+            "smart_replace는 테이블 추가/삭제를 지원하지 않습니다."
+        )
+
+    if len(md_paragraphs) != len(all_xml_paragraphs):
+        z_in.close()
+        raise ValueError(
+            "문단 수가 원본과 편집본에서 다릅니다. "
+            f"원본 XML={len(all_xml_paragraphs)}개, Markdown={len(md_paragraphs)}개. "
+            "HWPX 한 문단은 Markdown 한 줄로 유지해야 합니다."
+        )
+
+    table_old_items = []
+    table_new_items = []
+    for xt, mt in zip(all_xml_tables, md_tables):
+        for row_idx in range(min(xt['row_cnt'], len(mt['cells']))):
+            for col_idx in range(min(xt['col_cnt'], len(mt['cells'][row_idx]))):
+                table_old_items.append(xt['cells'][row_idx][col_idx])
+                table_new_items.append(mt['cells'][row_idx][col_idx])
+
+    growth_warnings = []
+    growth_warnings.extend(
+        collect_text_growth_warnings(table_old_items, table_new_items, kind='셀')
+    )
+    growth_warnings.extend(
+        collect_text_growth_warnings(all_xml_paragraphs, md_paragraphs, kind='문단')
+    )
+
+    if growth_warnings:
+        print("  레이아웃 주의: 텍스트가 크게 길어진 항목이 있습니다.")
+        for warning in growth_warnings[:5]:
+            print(f"    - {format_growth_warning(warning)}")
+        if len(growth_warnings) > 5:
+            print(f"    - 외 {len(growth_warnings) - 5}개")
+        if not allow_layout_risk:
+            z_in.close()
+            raise ValueError(
+                "텍스트 길이 증가로 레이아웃 위험이 감지되어 생성을 중단했습니다. "
+                "내용을 줄이거나, 위험을 확인한 뒤 --allow-layout-risk 옵션을 사용하세요."
+            )
 
     # 4. 테이블 매칭 및 섹션별 교체 목록 생성
     # per_section_replacements: {filename: [(old_escaped, new_escaped), ...]}
@@ -763,6 +1083,21 @@ def smart_replace(original_hwpx, edited_md, output_hwpx=None):
     else:
         print(f"  변경 사항 없음 — 원본 그대로 복사")
 
+    expected_cell_replacements = sum(len(v) for v in per_section_replacements.values())
+    expected_para_replacements = sum(len(v) for v in per_section_para_replacements.values())
+    if total_applied != expected_cell_replacements:
+        z_in.close()
+        raise ValueError(
+            "일부 테이블 셀 교체를 적용하지 못했습니다. "
+            f"예상={expected_cell_replacements}개, 적용={total_applied}개."
+        )
+    if total_para_applied != expected_para_replacements:
+        z_in.close()
+        raise ValueError(
+            "일부 문단 교체를 적용하지 못했습니다. "
+            f"예상={expected_para_replacements}개, 적용={total_para_applied}개."
+        )
+
     # 6. HWPX ZIP 재구성 (원본 파일 그대로 + 변경된 섹션만 교체)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z_out:
@@ -778,6 +1113,21 @@ def smart_replace(original_hwpx, edited_md, output_hwpx=None):
 
     with open(output_hwpx, 'wb') as f:
         f.write(buf.getvalue())
+
+    if strip_lineseg:
+        removed = strip_linesegarray(output_hwpx)
+        if removed:
+            print(f"  linesegarray 제거: {removed}개")
+
+    validation = validate_hwpx_integrity(output_hwpx, require_no_lineseg=strip_lineseg)
+    if not validation['ok']:
+        raise ValueError(
+            "산출물 검증 실패: " + " / ".join(validation['errors'])
+        )
+    print(
+        f"  산출물 검증: 섹션 {validation['section_count']}개, "
+        f"linesegarray {validation['linesegarray_count']}개"
+    )
 
     print(f"스마트 교체 완료: {output_hwpx}")
     return output_hwpx
@@ -800,9 +1150,15 @@ def main():
     parser.add_argument('original', help='원본 HWPX 파일 경로')
     parser.add_argument('markdown', help='편집된 마크다운 파일 경로')
     parser.add_argument('-o', '--output', help='출력 HWPX 파일 경로')
+    parser.add_argument('--keep-lineseg', action='store_true',
+                        help='줄 배치 캐시(linesegarray)를 유지합니다')
+    parser.add_argument('--allow-layout-risk', action='store_true',
+                        help='긴 텍스트로 인한 레이아웃 위험을 확인하고 생성을 허용합니다')
     args = parser.parse_args()
 
-    smart_replace(args.original, args.markdown, args.output)
+    smart_replace(args.original, args.markdown, args.output,
+                  strip_lineseg=not args.keep_lineseg,
+                  allow_layout_risk=args.allow_layout_risk)
 
 
 if __name__ == '__main__':

@@ -18,7 +18,16 @@ if str(PIPELINE_DIR) not in sys.path:
     sys.path.insert(0, str(PIPELINE_DIR))
 
 from hwpx_to_md import convert_hwpx_to_md, HwpxToMarkdown
-from smart_replace import smart_replace, parse_markdown_tables, parse_markdown_paragraphs
+from smart_replace import (
+    smart_replace,
+    strip_linesegarray,
+    parse_markdown_tables,
+    parse_markdown_paragraphs,
+    collect_text_growth_warnings,
+    collect_protected_markup_changes,
+    format_growth_warning,
+    format_protected_markup_change,
+)
 
 
 class PipelineService:
@@ -66,7 +75,8 @@ class PipelineService:
             'images_dir': converter.images_dir if converter.image_map else None
         }
 
-    def smart_replace(self, original_hwpx, edited_md_path, output_hwpx):
+    def smart_replace(self, original_hwpx, edited_md_path, output_hwpx,
+                      strip_lineseg=True, allow_layout_risk=False):
         """편집된 마크다운을 원본 HWPX에 반영
 
         Args:
@@ -82,7 +92,13 @@ class PipelineService:
             }
         """
         try:
-            result_path = smart_replace(original_hwpx, edited_md_path, output_hwpx)
+            result_path = smart_replace(
+                original_hwpx,
+                edited_md_path,
+                output_hwpx,
+                strip_lineseg=strip_lineseg,
+                allow_layout_risk=allow_layout_risk,
+            )
             return {
                 'success': True,
                 'output_path': result_path,
@@ -115,6 +131,8 @@ class PipelineService:
         edited_tables = parse_markdown_tables(edited_md)
 
         table_changes = 0
+        orig_cells = []
+        edited_cells = []
         for i in range(min(len(orig_tables), len(edited_tables))):
             orig = orig_tables[i]
             edited = edited_tables[i]
@@ -124,6 +142,8 @@ class PipelineService:
                 for col_idx in range(min(len(orig['cells'][row_idx]), len(edited['cells'][row_idx]))):
                     orig_cell = orig['cells'][row_idx][col_idx]
                     edited_cell = edited['cells'][row_idx][col_idx]
+                    orig_cells.append(orig_cell)
+                    edited_cells.append(edited_cell)
                     if orig_cell.strip() != edited_cell.strip():
                         table_changes += 1
 
@@ -136,11 +156,39 @@ class PipelineService:
             if orig_paras[i].strip() != edited_paras[i].strip():
                 para_changes += 1
 
+        layout_warnings = []
+        layout_warnings.extend(
+            format_growth_warning(w)
+            for w in collect_text_growth_warnings(
+                orig_cells,
+                edited_cells,
+                kind='셀',
+            )
+        )
+        layout_warnings.extend(
+            format_growth_warning(w)
+            for w in collect_text_growth_warnings(
+                orig_paras,
+                edited_paras,
+                kind='문단',
+            )
+        )
+        protected_changes = [
+            format_protected_markup_change(change)
+            for change in collect_protected_markup_changes(original_md, edited_md)
+        ]
+
         return {
             'table_changes': table_changes,
             'paragraph_changes': para_changes,
             'total_tables': len(orig_tables),
-            'total_paragraphs': len(orig_paras)
+            'total_paragraphs': len(orig_paras),
+            'edited_tables': len(edited_tables),
+            'edited_paragraphs': len(edited_paras),
+            'table_count_match': len(orig_tables) == len(edited_tables),
+            'paragraph_count_match': len(orig_paras) == len(edited_paras),
+            'layout_warnings': layout_warnings,
+            'protected_changes': protected_changes,
         }
 
     def strip_lineseg(self, hwpx_path, output_path=None):
@@ -157,36 +205,15 @@ class PipelineService:
             if output_path is None:
                 output_path = hwpx_path
 
-            # ZIP 파일로 읽기
-            with zipfile.ZipFile(hwpx_path, 'r') as zip_in:
-                # 새로운 ZIP 파일로 쓰기
-                temp_path = output_path + '.tmp'
-                with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED) as zip_out:
-                    for item in zip_in.infolist():
-                        data = zip_in.read(item.filename)
+            if output_path != hwpx_path:
+                import shutil
+                shutil.copy2(hwpx_path, output_path)
 
-                        # section*.xml 파일에서 linesegarray 제거
-                        if item.filename.startswith('Contents/section') and item.filename.endswith('.xml'):
-                            data_str = data.decode('utf-8')
-                            # linesegarray 태그 제거 (간단한 정규식 사용)
-                            import re
-                            data_str = re.sub(r'<hp:linesegarray[^>]*>.*?</hp:linesegarray>', '', data_str, flags=re.DOTALL)
-                            data = data_str.encode('utf-8')
-
-                        # mimetype은 압축하지 않음
-                        if item.filename == 'mimetype':
-                            zip_out.writestr(item, data, compress_type=zipfile.ZIP_STORED)
-                        else:
-                            zip_out.writestr(item, data)
-
-            # 임시 파일을 원본으로 교체
-            if os.path.exists(output_path):
-                os.remove(output_path)
-            os.rename(temp_path, output_path)
+            removed = strip_linesegarray(output_path)
 
             return {
                 'success': True,
-                'message': 'linesegarray 제거 완료'
+                'message': f'linesegarray 제거 완료: {removed}개'
             }
         except Exception as e:
             return {

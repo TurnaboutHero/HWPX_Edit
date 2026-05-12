@@ -27,7 +27,8 @@ from smart_replace import (
 )
 
 
-def auto_detect_and_process(original_hwpx, edited_md, output_hwpx=None, strip_lineseg=False):
+def auto_detect_and_process(original_hwpx, edited_md, output_hwpx=None,
+                            strip_lineseg=False, allow_layout_risk=False):
     """원본 HWPX와 편집된 마크다운을 비교하여 변경 유형 감지 및 자동 처리.
 
     변경 유형:
@@ -150,63 +151,15 @@ def auto_detect_and_process(original_hwpx, edited_md, output_hwpx=None, strip_li
         print()
 
     # 5. smart_replace 실행
-    result_path = smart_replace(original_hwpx, edited_md, output_hwpx)
-
-    # 6. linesegarray 제거 (옵션)
-    if strip_lineseg:
-        print()
-        print("linesegarray 제거 중...")
-        _strip_linesegarray(result_path)
-        print(f"linesegarray 제거 완료: {result_path}")
+    result_path = smart_replace(
+        original_hwpx,
+        edited_md,
+        output_hwpx,
+        strip_lineseg=strip_lineseg,
+        allow_layout_risk=allow_layout_risk,
+    )
 
     return result_path
-
-
-def _strip_linesegarray(hwpx_path):
-    """HWPX 파일에서 모든 linesegarray 태그 제거.
-
-    linesegarray는 줄 나눔 정보를 담고 있으나, 텍스트 변경 시 무효화되어
-    한글에서 렌더링 오류를 유발할 수 있습니다. 제거 시 한글이 자동으로 재계산합니다.
-    """
-    with open(hwpx_path, 'rb') as f:
-        hwpx_bytes = f.read()
-
-    z_in = zipfile.ZipFile(io.BytesIO(hwpx_bytes), 'r')
-    section_files = _find_section_files(z_in)
-
-    modified_sections = {}
-
-    for _, sec_filename in section_files:
-        raw_xml = z_in.read(sec_filename).decode('utf-8')
-
-        # linesegarray 태그 제거 (내용 포함 형태 + 자기 닫힘 형태 모두)
-        import re
-        modified_xml = re.sub(r'<[\w]+:linesegarray[^>]*>.*?</[\w]+:linesegarray>', '', raw_xml, flags=re.DOTALL)
-        modified_xml = re.sub(r'<[\w]+:linesegarray[^>]*?/>', '', modified_xml)
-
-        if modified_xml != raw_xml:
-            modified_sections[sec_filename] = modified_xml.encode('utf-8')
-
-    # 수정된 섹션으로 HWPX 재구성
-    if modified_sections:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z_out:
-            for item in z_in.infolist():
-                if item.filename in modified_sections:
-                    z_out.writestr(item.filename, modified_sections[item.filename])
-                elif item.filename == 'mimetype':
-                    z_out.writestr(item, z_in.read(item.filename),
-                                   compress_type=zipfile.ZIP_STORED)
-                else:
-                    z_out.writestr(item, z_in.read(item.filename))
-
-        z_in.close()
-
-        with open(hwpx_path, 'wb') as f:
-            f.write(buf.getvalue())
-    else:
-        z_in.close()
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -258,6 +211,10 @@ def main():
     smart_parser.add_argument('original', help='원본 HWPX 파일 경로')
     smart_parser.add_argument('markdown', help='편집된 마크다운 파일 경로')
     smart_parser.add_argument('-o', '--output', help='출력 HWPX 파일 경로')
+    smart_parser.add_argument('--keep-lineseg', action='store_true',
+                              help='줄 배치 캐시(linesegarray)를 유지합니다')
+    smart_parser.add_argument('--allow-layout-risk', action='store_true',
+                              help='긴 텍스트로 인한 레이아웃 위험을 확인하고 생성을 허용합니다')
 
     # auto 서브커맨드
     auto_parser = subparsers.add_parser(
@@ -268,6 +225,8 @@ def main():
     auto_parser.add_argument('-o', '--output', help='출력 HWPX 파일 경로')
     auto_parser.add_argument('--strip-lineseg', action='store_true',
                              help='linesegarray 제거 (기본: 유지)')
+    auto_parser.add_argument('--allow-layout-risk', action='store_true',
+                             help='긴 텍스트로 인한 레이아웃 위험을 확인하고 생성을 허용합니다')
 
     args = parser.parse_args()
 
@@ -280,10 +239,13 @@ def main():
     elif args.command == 'to-hwpx':
         convert_md_to_hwpx(args.input, args.output, args.reference_doc)
     elif args.command == 'smart':
-        smart_replace(args.original, args.markdown, args.output)
+        smart_replace(args.original, args.markdown, args.output,
+                      strip_lineseg=not args.keep_lineseg,
+                      allow_layout_risk=args.allow_layout_risk)
     elif args.command == 'auto':
         auto_detect_and_process(args.original, args.markdown, args.output,
-                                strip_lineseg=args.strip_lineseg)
+                                strip_lineseg=args.strip_lineseg,
+                                allow_layout_risk=args.allow_layout_risk)
 
 
 if __name__ == '__main__':

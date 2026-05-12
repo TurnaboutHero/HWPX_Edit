@@ -24,6 +24,7 @@ desktop.ini
 
 # OMC state
 .omc/
+.omx/
 
 # 사업계획서 원본 (개인 문서)
 *.hwpx
@@ -33,7 +34,10 @@ pipeline/output/*.md
 
 # 임시 파일
 temp_extract/
+work/
+pytest-cache-files-*/
 *.tmp
+*.stackdump
 
 # 테스트 출력물
 pipeline/output/
